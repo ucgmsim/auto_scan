@@ -215,7 +215,7 @@ def test_monitor_authorization_survives_redirect(monkeypatch: pytest.MonkeyPatch
             self.end_headers()
             self.wfile.write(body)
 
-        def log_message(self, *args) -> None:
+        def log_message(self, format: str, *args: object) -> None:
             pass
 
     server = http.server.HTTPServer(("127.0.0.1", 0), Handler)

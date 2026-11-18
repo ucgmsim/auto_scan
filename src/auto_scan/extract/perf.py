@@ -412,7 +412,21 @@ def parse_cpu_list(text: str) -> set[int]:
 
 @dataclass
 class RankInfo:
-    """What ``numa_bind.sh`` wrote about one rank (``ranks/rank-<n>.txt``)."""
+    """What ``numa_bind.sh`` wrote about one rank (``ranks/rank-<n>.txt``).
+
+    Parameters
+    ----------
+    rank : int
+        The MPI rank.
+    host : str
+        The node it ran on.
+    cpus : set of int
+        The CPUs it was bound to.
+    numa_nodes : list of str
+        The NUMA nodes those CPUs are on.
+    max_rss_kb : float or None
+        Its peak resident memory, if recorded.
+    """
 
     rank: int
     host: str
@@ -557,6 +571,18 @@ def central_core_hours(estimate: dict[str, Any]) -> float | None:
     model = estimate.get("cost_model") or {}
 
     def value(name: str) -> float | None:
+        """A cost-model factor's central value.
+
+        Parameters
+        ----------
+        name : str
+            The factor.
+
+        Returns
+        -------
+        float or None
+            Its value, or None if the estimate lacks it.
+        """
         factor = model.get(name)
         return _num(factor.get("value")) if isinstance(factor, dict) else None
 
@@ -1149,7 +1175,41 @@ def extract_run(db: sqlite3.Connection, event_id: str, resolution: str, run_dir:
 
 @dataclass
 class Job:
-    """One ``jobs`` row, with its times parsed."""
+    """One ``jobs`` row, with its times parsed.
+
+    Parameters
+    ----------
+    cycle : str
+        The cycle point.
+    name : str
+        The task's name.
+    base : str
+        The name without its resolution suffix.
+    resolution : str
+        The resolution in the name, or ''.
+    submit_num : int
+        Which submission of the task this is.
+    state : str
+        The monitor's state for the job.
+    submitted : datetime or None
+        When it was submitted.
+    started : datetime or None
+        When it started running.
+    ended : datetime or None
+        When it exited.
+    run_s : float or None
+        Seconds running.
+    queue_s : float or None
+        Seconds queued, from the job's own times.
+    cores : float or None
+        Cores requested.
+    time_limit_s : float or None
+        Its time limit.
+    core_hours : float or None
+        Cores times hours running.
+    job_err : str
+        The end of its ``job.err``, for a failed job.
+    """
 
     cycle: str
     name: str
@@ -1169,7 +1229,13 @@ class Job:
 
     @property
     def interval(self) -> tuple[datetime, datetime] | None:
-        """The job's run, start to exit, or None if it never started or hasn't ended."""
+        """The job's run, start to exit.
+
+        Returns
+        -------
+        tuple of datetime, or None
+            ``(started, ended)``, or None if it never started or hasn't ended.
+        """
         if self.started is None:
             return None
         if self.ended is not None:

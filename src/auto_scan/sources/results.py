@@ -61,7 +61,7 @@ def run_rclone(args: list[str]) -> str:
     Returns
     -------
     str
-        rclone's standard output.
+        The standard output of rclone.
 
     Raises
     ------
@@ -128,7 +128,7 @@ def list_files(config: Config, event_dir: str) -> list[dict[str, Any]]:
     Returns
     -------
     list of dict
-        rclone's ``lsjson`` entries for files (``Path`` relative to the event
+        The ``lsjson`` entries of rclone for files (``Path`` relative to the event
         directory, ``Size``, ``ModTime``); directories are left out.
     """
     entries = json.loads(run_rclone(["lsjson", "-R", "--files-only", f"{config.results_url}/{event_dir}"]))
@@ -201,7 +201,7 @@ def run_includes(resolutions: list[str]) -> list[str]:
     Returns
     -------
     list of str
-        rclone ``--include`` patterns: the event-level realisation files, and each
+        The rclone ``--include`` patterns: the event-level realisation files, and each
         run's small files plus its IM database and waveforms.
     """
     patterns = [f"/{name}" for name in EVENT_FILES]

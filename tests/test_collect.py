@@ -7,6 +7,7 @@ import shutil
 import sqlite3
 import tarfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -122,7 +123,12 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     rclone = FakeRclone(remote)
     monkeypatch.setattr(results, "run_rclone", rclone)
 
-    state = {"flatfiles": True, "station_ims": {"event_id": EVENT, "sites": []}, "jobs": [], "summary_calls": 0}
+    state: dict[str, Any] = {
+        "flatfiles": True,
+        "station_ims": {"event_id": EVENT, "sites": []},
+        "jobs": [],
+        "summary_calls": 0,
+    }
 
     def flatfiles(config, event_id, dest):
         if not state["flatfiles"]:

@@ -383,7 +383,20 @@ def suspect_ranges(db: sqlite3.Connection, finding_id: int) -> list[dict[str, An
         bad = history[bad_index]
 
     def resolution_of(entry: dict[str, Any] | None, failing: bool) -> str:
-        """The resolution of the entry's evaluation that passed or failed, '' if event-wide."""
+        """The resolution of the entry's evaluation that passed or failed.
+
+        Parameters
+        ----------
+        entry : dict or None
+            One event's evaluations.
+        failing : bool
+            Whether to look for the failing evaluation or the passing one.
+
+        Returns
+        -------
+        str
+            The resolution, or '' if the evaluation is event-wide or there is none.
+        """
         if entry is None:
             return ""
         return next((row["resolution"] for row in entry["rows"] if bool(row["failing"]) == failing), "")

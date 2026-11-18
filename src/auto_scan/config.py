@@ -96,12 +96,24 @@ class Config:
 
     @property
     def monitor_reader_token(self) -> str | None:
-        """The monitor's read-only token (``CYLC_MONITOR_READER_TOKEN`` or its file)."""
+        """The monitor's read-only token (``CYLC_MONITOR_READER_TOKEN`` or its file).
+
+        Returns
+        -------
+        str or None
+            The token, or None if neither is set.
+        """
         return _token("CYLC_MONITOR_READER_TOKEN", "~/.config/cylc-monitor/reader-token")
 
     @property
     def writer_token(self) -> str | None:
-        """The token that may upload ``scan.db`` (``AUTO_SCAN_WRITER_TOKEN`` or its file)."""
+        """The token that may upload ``scan.db`` (``AUTO_SCAN_WRITER_TOKEN`` or its file).
+
+        Returns
+        -------
+        str or None
+            The token, or None if neither is set.
+        """
         return _token("AUTO_SCAN_WRITER_TOKEN", "~/.config/auto-scan/writer-token")
 
     def event_cache(self, event_dir: str) -> Path:

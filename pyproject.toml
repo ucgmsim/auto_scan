@@ -45,3 +45,12 @@ include = ["src/auto_scan"]
 # The ucgmsim rule set, with private names exempt.
 checks = ["GL05", "GL08", "GL10", "PR01", "PR02", "PR03", "PR04", "PR05", "PR06", "PR07", "RT01", "RT02", "RT03", "RT04", "YD01"]
 exclude = ["\\._"]
+
+[tool.deptry]
+known_first_party = ["auto_scan"]
+# The Datasette plugin runs in the server's image, not in this environment.
+extend_exclude = ["server"]
+
+[tool.deptry.per_rule_ignores]
+# xarray opens the waveform files through these; nothing imports them by name.
+DEP002 = ["h5netcdf", "h5py"]
