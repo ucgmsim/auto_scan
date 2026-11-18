@@ -1,0 +1,42 @@
+[project]
+name = "auto-scan"
+version = "0.1.0"
+description = "CI analysis of the automated realtime earthquake simulations: scientific review and performance."
+readme = "README.md"
+authors = [
+    { name = "Jake Faulkner", email = "jake.faulkner@canterbury.ac.nz" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "duckdb>=2.0.0",
+    "h5netcdf>=1.8.3",
+    "h5py>=3.16.0",
+    "numpy>=2.5.5",
+    "pandas>=3.1.1",
+    "scipy>=1.18.1",
+    "xarray>=2026.9.0",
+]
+
+[project.scripts]
+auto-scan = "auto_scan.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.13.0,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "deptry>=0.25.1",
+    "pytest>=9.2.0",
+    "ruff>=0.17.5",
+    "ty>=0.0.106",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
+
+[tool.npdlint]
+include = ["src/auto_scan"]
