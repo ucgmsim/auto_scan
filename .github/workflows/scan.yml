@@ -1,0 +1,223 @@
+name: Scan
+
+# Review every new realtime simulation for scientific and performance problems
+# (`auto-scan run`), then, when findings are open, have Claude confirm each one in
+# the source and file an issue in the repository at fault (prompts/triage.md).
+# See README.md for the secrets and the variable this needs.
+on:
+  schedule:
+    - cron: "7,37 * * * *"  # every 30 minutes, off the hour
+  workflow_dispatch:
+    inputs:
+      event:
+        description: "Rescan only this event id (e.g. 2026p866048), even if scanned before. Empty: every new run."
+        type: string
+        default: ""
+      triage:
+        description: "Run the Claude triage when findings are open"
+        type: boolean
+        default: true
+      max-findings:
+        description: "Most findings the triage takes on in one run"
+        type: number
+        default: 5
+      model:
+        description: "Claude model for the triage"
+        type: string
+        default: "claude-opus-5-5"
+
+# Both jobs read and write the one scan.db in the state store: never two runs at once,
+# and never cancel one halfway through a push.
+concurrency:
+  group: scan
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  RCLONE_VERSION: "1.75.2"
+  # sha256 of rclone-v1.75.2-linux-amd64.deb, from https://downloads.rclone.org/v1.75.2/SHA256SUMS
+  RCLONE_SHA256: "efbfe852181f7191eb3c9043ed1ab49c9b2d0ba045c61c926a5da111c939ec5c"
+  AUTO_SCAN_DATASETTE_URL: ${{ vars.DATASETTE_URL }}
+  AUTO_SCAN_DB: ${{ github.workspace }}/scan.db
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    outputs:
+      open_findings: ${{ steps.summary.outputs.open_findings }}
+    env:
+      CYLC_MONITOR_READER_TOKEN: ${{ secrets.CYLC_MONITOR_READER_TOKEN }}
+      AUTO_SCAN_WRITER_TOKEN: ${{ secrets.AUTO_SCAN_WRITER_TOKEN }}
+      GH_TOKEN: ${{ secrets.SCAN_GH_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync
+
+      - name: Install rclone
+        run: |
+          deb="rclone-v${RCLONE_VERSION}-linux-amd64.deb"
+          curl -fsSLo "$RUNNER_TEMP/$deb" "https://downloads.rclone.org/v${RCLONE_VERSION}/$deb"
+          echo "$RCLONE_SHA256  $RUNNER_TEMP/$deb" | sha256sum -c -
+          sudo dpkg -i "$RUNNER_TEMP/$deb"
+          rclone version
+      - name: Configure rclone
+        env:
+          RCLONE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          install -d -m 700 ~/.config/rclone
+          umask 077
+          printf '%s\n' "$RCLONE_CONFIG_TEXT" > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+
+      - id: start
+        run: echo "at=$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" >> "$GITHUB_OUTPUT"
+
+      # The whole loop: pull, collect, check, verify, push. A failure to read or write
+      # the state store stops the run before anything is pushed.
+      - name: Scan
+        if: inputs.event == ''
+        run: uv run --no-sync auto-scan run
+
+      - name: Rescan one event
+        if: inputs.event != ''
+        env:
+          EVENT: ${{ inputs.event }}
+        run: |
+          uv run --no-sync auto-scan pull
+          uv run --no-sync auto-scan collect "$EVENT" --force
+          uv run --no-sync auto-scan check "$EVENT"
+          uv run --no-sync auto-scan verify
+          uv run --no-sync auto-scan push
+
+      - id: summary
+        name: Summarise the scan
+        if: always()
+        env:
+          SINCE: ${{ steps.start.outputs.at }}
+        run: |
+          if [ ! -f "$AUTO_SCAN_DB" ]; then
+            echo "No scan.db: the scan stopped before it had one." >> "$GITHUB_STEP_SUMMARY"
+            echo "open_findings=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          uv run --no-sync python - <<'EOF'
+          import os
+          from auto_scan import issues
+          from auto_scan.db import connect
+
+          db = connect(os.environ["AUTO_SCAN_DB"])
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a") as out:
+              out.write(issues.summary(db, since=os.environ.get("SINCE") or None))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"open_findings={len(issues.unfiled_open(db))}\n")
+          EOF
+
+  triage:
+    needs: scan
+    if: >-
+      needs.scan.result == 'success' &&
+      fromJSON(needs.scan.outputs.open_findings || '0') > 0 &&
+      (github.event_name != 'workflow_dispatch' || inputs.triage)
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      # Read, comment on and file issues in the ucgmsim repositories, and clone them:
+      # github.token is scoped to this repository only.
+      GH_TOKEN: ${{ secrets.SCAN_GH_TOKEN }}
+      AUTO_SCAN_WRITER_TOKEN: ${{ secrets.AUTO_SCAN_WRITER_TOKEN }}
+      MAX_FINDINGS: ${{ inputs.max-findings || 5 }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: |
+          uv sync
+          echo ".ai/" >> .git/info/exclude
+          mkdir -p .ai
+
+      - name: Install rclone
+        run: |
+          deb="rclone-v${RCLONE_VERSION}-linux-amd64.deb"
+          curl -fsSLo "$RUNNER_TEMP/$deb" "https://downloads.rclone.org/v${RCLONE_VERSION}/$deb"
+          echo "$RCLONE_SHA256  $RUNNER_TEMP/$deb" | sha256sum -c -
+          sudo dpkg -i "$RUNNER_TEMP/$deb"
+      - name: Configure rclone
+        env:
+          RCLONE_CONFIG_TEXT: ${{ secrets.RCLONE_CONFIG }}
+        run: |
+          install -d -m 700 ~/.config/rclone
+          umask 077
+          printf '%s\n' "$RCLONE_CONFIG_TEXT" > ~/.config/rclone/rclone.conf
+          chmod 600 ~/.config/rclone/rclone.conf
+      # git clone of private ucgmsim repositories authenticates through gh, with GH_TOKEN.
+      - run: gh auth setup-git
+
+      - name: Write the brief
+        id: brief
+        run: |
+          uv run --no-sync auto-scan pull
+          uv run --no-sync auto-scan brief --max-findings "$MAX_FINDINGS" --out .ai/brief.md
+          if [ -s .ai/brief.md ]; then
+            echo "empty=false" >> "$GITHUB_OUTPUT"
+            { echo "### Triage brief"; echo; grep '^## Finding' .ai/brief.md; echo; } >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "empty=true" >> "$GITHUB_OUTPUT"
+            echo "Nothing to triage." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      # The standing instructions, read from the file rather than inlined so they can be
+      # reviewed and changed like code. A random delimiter: the file can't end the value early.
+      - name: Read the prompt
+        id: prompt
+        if: steps.brief.outputs.empty == 'false'
+        run: |
+          delimiter="PROMPT_$(openssl rand -hex 16)"
+          {
+            echo "text<<$delimiter"
+            cat prompts/triage.md
+            echo
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
+      - id: claude
+        if: steps.brief.outputs.empty == 'false'
+        uses: anthropics/claude-code-action@v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          # A custom token, not the Claude App's: the issues go to other repositories. The
+          # action exports it to Claude's tools as GH_TOKEN and GITHUB_TOKEN.
+          github_token: ${{ secrets.SCAN_GH_TOKEN }}
+          prompt: ${{ steps.prompt.outputs.text }}
+          claude_args: |
+            --model ${{ inputs.model || 'claude-opus-5-5' }}
+            --max-turns 200
+            --allowedTools "Read,Write,Glob,Grep,Bash(uv run:*),Bash(git clone:*),Bash(gh repo clone:*),Bash(git log:*),Bash(git diff:*),Bash(git show:*),Bash(git -C:*),Bash(rclone copy:*),Bash(rclone copyto:*),Bash(rclone lsf:*),Bash(rclone cat:*),Bash(tar:*),Bash(gh issue list:*),Bash(gh issue view:*),Bash(gh issue create:*),Bash(gh issue comment:*),Bash(gh pr list:*),Bash(gh pr view:*),Bash(gh label create:*)"
+
+      # Store the links Claude recorded (`auto-scan link`), and its dismissals.
+      - name: Push
+        if: always() && steps.brief.outputs.empty == 'false'
+        run: uv run --no-sync auto-scan push
+
+      # Claude's own output is hidden from the log; put its final message, and any tool
+      # calls the allowlist refused, in the job summary so a run that did nothing says why.
+      - name: Summarise Claude's run
+        if: always() && steps.claude.outputs.execution_file != ''
+        env:
+          LOG: ${{ steps.claude.outputs.execution_file }}
+        run: |
+          jq -r '.[] | select(.type == "result")
+            | "### Claude: \(.subtype), \(.num_turns) turns, $\(.total_cost_usd * 100 | round / 100)\n\n\(.result // "(no final message)")\n"
+              + (if (.permission_denials // []) == [] then "" else
+                 "\nRefused tool calls:\n\n" + (.permission_denials | map("- \(.tool_name): `\(.tool_input | tojson | .[:200])`") | join("\n")) end)' \
+            "$LOG" >> "$GITHUB_STEP_SUMMARY"

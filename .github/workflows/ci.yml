@@ -1,0 +1,16 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  # ruff, ty, pytest, deptry and npdlint, as every ucgmsim repository runs them.
+  ci:
+    uses: ucgmsim/meta-ci-action/.github/workflows/ci.yml@v2
+    with:
+      # npdlint parses the code, which is written for the project's Python.
+      python-version: "3.13"
+      # [tool.pytest.ini_options] testpaths.
+      pytest-paths: ""

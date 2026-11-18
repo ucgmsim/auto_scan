@@ -40,3 +40,8 @@ line-length = 120
 
 [tool.npdlint]
 include = ["src/auto_scan"]
+
+[tool.numpydoc_validation]
+# The ucgmsim rule set, with private names exempt.
+checks = ["GL05", "GL08", "GL10", "PR01", "PR02", "PR03", "PR04", "PR05", "PR06", "PR07", "RT01", "RT02", "RT03", "RT04", "YD01"]
+exclude = ["\\._"]

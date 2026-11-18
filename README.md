@@ -1,0 +1,275 @@
+# auto_scan
+
+auto_scan reviews every automated realtime earthquake simulation run by
+[realtime_simulation_workflow](https://github.com/ucgmsim/realtime_simulation_workflow)
+for scientific and performance problems. When a check fails, it files a GitHub issue
+in the repository at fault. On later events it checks that the fix worked. It never
+touches the cluster: everything it reads has already been published off it (the
+results on Dropbox, the Cylc monitor's Datasette, SimDB and SeismicNow).
+
+DESIGN.md has the contracts between the modules: the database schema, the cache
+layout, the rules for extractors and checks, and the findings lifecycle.
+
+## The loop
+
+A scheduled GitHub Action (`.github/workflows/scan.yml`, every 30 minutes) runs:
+
+1. `auto-scan pull`: fetch `scan.db`, the store of record, from the state store (rclone).
+2. `auto-scan collect`: download each new or changed run, run the extractors, and
+   record the metrics, station residuals and SW4 timers.
+3. `auto-scan check`: run every check. Each failure opens or updates a finding.
+4. `auto-scan verify`: follow the issues of filed findings. A fix that holds on later
+   events is verified, and a failure after the fix reopens the issue.
+5. `auto-scan push`: store `scan.db` again, and upload a copy to the Datasette for the
+   dashboard.
+
+When findings are open, a second job writes a brief (`auto-scan brief`) and runs
+Claude with the standing instructions in `prompts/triage.md`. Claude confirms each
+finding in the source and files one issue in the repository at fault, labelled
+`ai-suggested`, `ai-ok` and `scan`. Then it records the link with `auto-scan link`.
+Each repository's `ai-issue-solver` from
+[meta-ci-action](https://github.com/ucgmsim/meta-ci-action) then attempts the fix.
+Claude dismisses a finding that is not a problem, and files one whose cause it could
+not establish in realtime_simulation_workflow without `ai-ok`, for a person.
+
+## Running it locally
+
+```sh
+uv sync
+uv run auto-scan run --no-push          # pull, collect, check, verify; nothing uploaded
+uv run auto-scan collect 2026p866048 --force
+uv run auto-scan check 2026p866048
+uv run auto-scan brief --out brief.md   # what the triage would read
+uv run auto-scan push --no-datasette    # store scan.db but don't upload it
+```
+
+You need rclone configured with the remotes in `AUTO_SCAN_RESULTS_URL` and
+`AUTO_SCAN_STATE_URL`, and the monitor's reader token. `verify` needs `gh`
+authenticated (`GH_TOKEN`). `pull` refuses to start from an empty database if rclone
+fails. `push` refuses to upload a database with fewer events than it pulled; set
+`AUTO_SCAN_ALLOW_SHRINK=1` if you really mean to. Each day's first upload is also
+kept as `history/scan-<YYYYMMDD>.db` in the state store, so a bad push can be undone
+by copying one back.
+
+Tests are offline: `uv run pytest`.
+
+## Settings, secrets and variables
+
+Every setting is one environment variable, read in `src/auto_scan/config.py`.
+
+| Name | Kind | What it is for |
+|---|---|---|
+| `RCLONE_CONFIG` | org secret (exists) | The text of an `rclone.conf` with the Dropbox remote. The workflow writes it to `~/.config/rclone/rclone.conf`. |
+| `CLAUDE_CODE_OAUTH_TOKEN` | org secret (exists) | Claude for the triage job, as in meta-ci-action. |
+| `SCAN_GH_TOKEN` | repository secret (create) | The `gh` token for `verify` and the triage: it reads, files, comments on and reopens issues in the other ucgmsim repositories and clones them. `github.token` can't, because it only covers this repository. |
+| `CYLC_MONITOR_READER_TOKEN` | repository secret (create) | The Cylc monitor's `cylc-reader` token. The scan reads the monitor's `jobs` view with it. |
+| `AUTO_SCAN_WRITER_TOKEN` | repository secret (create) | The Datasette's `scan-writer` token, for `push`'s upload (see [Deploying the server side](#deploying-the-server-side)). Without it, `push` stores `scan.db` and skips the upload with a warning. |
+| `DATASETTE_URL` | repository variable (create) | The Datasette's base URL, e.g. `https://<your-datasette>`. The workflow passes it as `AUTO_SCAN_DATASETTE_URL`. |
+| `AUTO_SCAN_DATASETTE_URL` | env | Where the scan database and dashboard are hosted. It also sets the monitor URL unless `AUTO_SCAN_MONITOR_URL` is set. |
+| `AUTO_SCAN_MONITOR_URL`, `AUTO_SCAN_MONITOR_DATABASE` | env | The Cylc monitor's Datasette and database name (`cylc`). |
+| `AUTO_SCAN_DATABASE` | env | The scan's database name on the Datasette (`scan`). |
+| `AUTO_SCAN_WORKFLOW` | env | The Cylc workflow scanned (`realtime/run1`). |
+| `AUTO_SCAN_RESULTS_URL` | env | The rclone path the realtime workflow uploads results to. |
+| `AUTO_SCAN_STATE_URL` | env | The rclone directory holding `scan.db` and `history/`. |
+| `AUTO_SCAN_SIMDB_API`, `AUTO_SCAN_SEISMICNOW_API` | env | The two public APIs. |
+| `AUTO_SCAN_CACHE`, `AUTO_SCAN_KEEP_CACHE` | env | The download cache (`~/.cache/auto-scan`), and `1` to keep its large files. |
+| `AUTO_SCAN_DB` | env | The local `scan.db`. |
+| `AUTO_SCAN_ALLOW_SHRINK` | env | `1` lets `push` upload a database with fewer events than it pulled. |
+
+`CYLC_MONITOR_READER_TOKEN` and `AUTO_SCAN_WRITER_TOKEN` can also come from files
+(`~/.config/cylc-monitor/reader-token`, `~/.config/auto-scan/writer-token`, or the
+paths in `<NAME>_FILE`).
+
+### `SCAN_GH_TOKEN`
+
+Use a fine-grained personal access token with resource owner `ucgmsim`, limited to
+this repository and every repository a run's manifest names in `sources` (the
+workflow itself, `sw4`, `workflow`, `source_modelling`, `IM_calculation`, `qcore`, and
+so on). Give it these repository permissions:
+
+- **Issues: read and write.** It views, files, comments on, reopens and labels issues,
+  and creates the `scan`, `ai-suggested`, `ai-ok`, `ai-serious` and
+  `needs-investigation` labels.
+- **Contents: read.** It clones private repositories to read the suspect commits.
+- **Pull requests: read.** It searches for duplicates.
+- **Metadata: read.** GitHub requires this one.
+
+Don't give it contents write: the triage only reads code.
+
+Each repository's `ai-issue-solver` acts on an `ai-ok` label only if a maintainer
+applied it, or if a trusted bot applied it to an issue a bot opened. So the token
+must belong to a maintainer listed in that workflow's `maintainers` input, or be the `ucgmsim[bot]` app's token. Otherwise the
+solver ignores the issues the triage files.
+
+### Setting them
+
+```sh
+gh secret set SCAN_GH_TOKEN -R ucgmsim/auto_scan
+gh secret set CYLC_MONITOR_READER_TOKEN -R ucgmsim/auto_scan < ~/.config/cylc-monitor/reader-token
+gh secret set AUTO_SCAN_WRITER_TOKEN -R ucgmsim/auto_scan < scan-writer.token
+gh variable set DATASETTE_URL -R ucgmsim/auto_scan --body 'https://<your-datasette>'
+```
+
+## The workflow
+
+`.github/workflows/scan.yml` has two jobs, and never runs twice at once
+(`concurrency: scan`), because both read and write the one `scan.db`.
+
+- `scan` installs a pinned rclone (the official .deb, checked against its sha256),
+  then runs `auto-scan run`. It writes a job summary from the database: runs scanned,
+  and findings opened, verified, regressed and dismissed. It outputs the number of
+  open, unfiled findings. When no manifest changed, it only pulls, reads the monitor,
+  lists the results and pushes: a couple of minutes.
+- `triage` runs when that number is above zero. It pulls, writes `.ai/brief.md` (at
+  most `max-findings`, 5 by default) and runs `anthropics/claude-code-action@v1` with
+  `prompts/triage.md`. Then it pushes, so the links Claude recorded are stored. Claude
+  works with `SCAN_GH_TOKEN` (the action's `github_token` input, which the action also
+  exports as `GH_TOKEN` to Claude's tools). Its tools are limited to reading files,
+  `uv run`, read-only `git`, `rclone copy`/`lsf`/`cat`, `tar`, and `gh` issue and label
+  commands. The job summary has Claude's final message and any tool calls the
+  allowlist refused.
+
+Run it by hand from the Actions tab. The inputs are `event` (rescan one event with
+`--force`), `triage` (off to skip Claude), `max-findings` and `model`.
+
+`ci.yml` and `claude-review.yml` call meta-ci-action's shared workflows (`@v2`), as
+every ucgmsim repository does. `lefthook.yml` runs the same checks as git hooks
+(`uvx lefthook install`).
+
+## Deploying the server side
+
+The scan's database and dashboard live on the Cylc monitor's Datasette, as a second
+database (`scan`) beside `cylc`. Datasette is pinned to 1.0a41 and
+datasette-dashboards to 0.8.0 there. `server/` holds three files:
+
+- `server/plugins/scan_upload.py`: `POST /-/scan/upload`. It takes a gzipped
+  snapshot of `scan.db`, from the `scan-writer` actor only, up to 200 MB. It checks
+  that the snapshot is an SQLite database with a known `meta.schema_version`. Then, in
+  one transaction, it replaces every table of the `scan` database with the snapshot's
+  and remakes the views. It also registers the SQL aggregate `stdev()`, which the
+  views use.
+- `server/scan_views.sql`: the views the dashboard reads.
+- `server/scan_dashboard.yaml`: the dashboard, `/-/dashboards/scan`.
+
+On the monitor's host, in its deployment directory (`~/cylc-monitor` in its README):
+
+1. **Copy the files** into a subdirectory:
+   ```sh
+   mkdir -p ~/cylc-monitor/scan
+   scp server/plugins/scan_upload.py server/scan_views.sql server/scan_dashboard.yaml host:cylc-monitor/scan/
+   ```
+2. **docker-compose.yml**: serve a second database, and mount the plugin and the
+   views into the image's `/app`:
+   ```yaml
+   services:
+     datasette:
+       command: >
+         datasette serve /data/cylc.db /data/scan.db --create --config /app/datasette.yaml --plugins-dir /app/plugins
+         --host 0.0.0.0 --port 8001
+         --setting sql_time_limit_ms 3000 --setting max_returned_rows 5000
+         --setting force_https_urls 1
+       volumes:
+         - ./data:/data
+         - ./scan/scan_upload.py:/app/plugins/scan_upload.py:ro
+         - ./scan/scan_views.sql:/app/scan_views.sql:ro
+   ```
+   The only change to `command` is `/data/scan.db` after `/data/cylc.db`. `--create`
+   makes the empty file on first start. The plugin finds `scan_views.sql` at
+   `/app/scan_views.sql`, the directory above its own.
+3. **datasette.yaml**: let the writer in, and add the dashboard.
+   - Add `scan-writer` to the instance's `allow` list:
+     `allow: {id: [admin, cylc-reader, cylc-writer, scan-writer]}`. The plugin checks
+     the actor's id itself. Like `cylc-writer`, the token may otherwise only view the
+     instance.
+   - Paste `scan/scan_dashboard.yaml` under `plugins: datasette-dashboards:`, beside
+     `cylc:`. It is already indented for that place. In today's `datasette.yaml` that
+     section ends the file, so `cat scan/scan_dashboard.yaml >> datasette.yaml` does
+     it. Check the result with `python3 -c 'import yaml,sys; yaml.safe_load(open("datasette.yaml"))'`.
+
+   `cylc-reader` reads the scan database and its dashboard with no further change:
+   its token grants `view-database`, `view-table`, `view-query` and `execute-sql` on
+   every database. `admin` sees everything.
+4. **Restart**: `sudo docker compose up -d --build`. The datasette.yaml change needs
+   the rebuild, because the image copies it.
+5. **Mint the writer token** with the secret already in the container:
+   ```sh
+   sudo docker compose exec -T datasette sh -c \
+     'datasette create-token scan-writer --all view-instance --secret "$DATASETTE_SECRET"' > scan-writer.token
+   chmod 600 scan-writer.token
+   ```
+   Store it as the `AUTO_SCAN_WRITER_TOKEN` secret (above), then delete the file.
+   Alternatively, add `"scan-writer": ["scan-writer", "--all", "view-instance"]` to
+   `TOKENS` in the monitor's `server/make_token.py` and run
+   `python /app/make_token.py scan-writer`. Rotating `DATASETTE_SECRET` revokes this
+   token with all the others.
+6. **Check**: run the workflow once by hand. `push` logs `uploaded to .../-/scan/upload`,
+   and `https://<your-datasette>/-/dashboards/scan` shows the scan. Until the first
+   upload, the dashboard errors, because the views need the tables.
+
+To update the server side, copy the changed files and run `sudo docker compose
+restart datasette`. The views are remade at startup.
+
+### Moving the Datasette
+
+The Datasette's address is one setting: the repository variable `DATASETTE_URL`.
+Deploy `server/` beside the monitor on the new host as above, mint a new writer token
+there, then:
+
+```sh
+gh variable set DATASETTE_URL -R ucgmsim/auto_scan --body 'https://<new-datasette>'
+gh secret set AUTO_SCAN_WRITER_TOKEN -R ucgmsim/auto_scan < scan-writer.token
+```
+
+Nothing else names the host. `scan.db` lives in the state store, not on the server,
+so the next push fills the new server. If the monitor stays behind while the scan
+moves, also set `AUTO_SCAN_MONITOR_URL` in the workflow's env.
+
+## Adding a check
+
+A check is a function in `src/auto_scan/checks/<area>.py`, registered with `@check`.
+It reads only the database and yields an `Evaluation` per subject, passing or
+failing (see `registry.py`). Most checks need a metric first: write it in an
+extractor under `src/auto_scan/extract/` with `db.set_metric`, and document it in the
+module docstring's table. DESIGN.md has the rules. Briefly:
+
+- Yield an evaluation whether it passes or fails, and nothing when an input is
+  missing. Passes are how a fix gets verified.
+- Thresholds are module constants, each with a comment saying where the number comes
+  from. Compare with the metric's own history (`db.metric_history`) once there are 5
+  earlier events.
+- The `title` names the problem without one event's numbers. The `summary` has them.
+- `suspect_sources` names the `run_sources.source` entries likely at fault (or
+  `realtime`). The triage reads the commit range of those.
+- `evidence` holds what is needed to reproduce the number.
+
+Add a test with a small synthetic database. Then `uv run auto-scan check --force`
+locally shows what it would have found on the events so far. If the dashboard should
+show the new metric, add a column to a view in `server/scan_views.sql` and a chart to
+`server/scan_dashboard.yaml`. `metric_values` already shows any metric's history.
+
+## A finding's life
+
+`(check_id, subject)` names a finding.
+
+- **open**: a check failed on the latest event (or on 2 of the last 5), and no live
+  finding existed. Later failures update its summary, evidence and `n_failing`.
+- **filed**: the triage, or a person, filed or found its issue and ran `auto-scan link
+  ID URL`. The brief stops listing it.
+- **fix_pending**: its issue was closed as completed. `verify` then looks at the
+  check on runs whose manifest was written after the close:
+  - any failure: the issue is reopened with a comment and the new numbers, and the
+    finding goes back to **filed**, with the regression recorded in its evidence;
+  - passes on 1 later event (2 for a science check), and no failure: **verified**,
+    with a comment on the issue naming the events.
+
+  An issue reopened by hand sends the finding back to **filed**.
+- **dismissed**: the triage or a person judged it not a problem
+  (`auto-scan dismiss ID "reason"`), or its issue was closed as not planned or as a
+  duplicate. The same check and subject don't open a new finding for 90 days.
+- An **open** finding that passes on 3 consecutive later events closes itself as
+  **verified**, without an issue.
+
+To take a finding out of the triage's hands, file or find the issue yourself and run
+`auto-scan link`. To stop it, `auto-scan dismiss`. Locally, run `auto-scan pull` first
+and `auto-scan push` after, and not while the workflow is running: the workflow's next
+push would overwrite a change made in between.
