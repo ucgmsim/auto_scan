@@ -215,6 +215,25 @@ def test_trends(check_name: str, slope: float, se: float, gmm: float, failing: b
     assert only(run(getattr(checks, check_name), con)).failing is failing
 
 
+@pytest.mark.parametrize("check_name", ["distance_trend", "vs30_trend"])
+def test_trend_without_gmm_slope_is_not_corroborated(check_name: str) -> None:
+    # 2026p742111 1hz PGA: -0.842 +- 0.280 (t = 3.0) with no GMM slope; the other IMs ordinary.
+    con = database()
+    variable = "lnrrup" if check_name == "distance_trend" else "lnvs30"
+    values = _trend(variable, -0.3, 0.2, 0.1)
+    gmm_name = "science.gmm_all.slope_lnrrup" if variable == "lnrrup" else "science.gmm_residual.slope_lnvs30"
+    values[f"science.residual.slope_{variable}.PGA"] = -0.85
+    values[f"science.residual.slope_{variable}_se.PGA"] = 0.28
+    del values[f"{gmm_name}.PGA"]
+    put(con, values)
+    e = only(run(getattr(checks, check_name), con))
+    assert not e.failing
+    assert e.evidence["per_im"]["PGA"] == {"slope": -0.85, "se": 0.28, "n": 40, "gmm_slope": None, "failing": False}
+    # The same observed slope, corroborated by the GMM, still fails.
+    put(con, {f"{gmm_name}.PGA": -0.9})
+    assert only(run(getattr(checks, check_name), con)).failing
+
+
 def test_trend_needs_persistence_with_history() -> None:
     events = [f"2026p00000{i}" for i in range(6)] + [EVENT]
     con = database(events)
@@ -305,6 +324,65 @@ def test_timing_offset_from_picks(intercept: float, se: float, failing: bool) ->
         },
     )
     assert only(run(checks.timing_offset, con)).failing is failing
+
+
+def _s_offsets(
+    corrected: float, uncorrected: float, pick_geonet: float | None, pick_sim: float | None, se: float = 0.5
+) -> dict[str, Any]:
+    values: dict[str, Any] = {
+        "science.wave.s_offset.n": 15,
+        "science.wave.s_offset.median": corrected - 2.0,
+        "science.wave.s_offset.intercept": corrected,
+        "science.wave.s_offset.intercept_se": se,
+        "science.wave.s_offset.intercept_uncorrected": uncorrected,
+        "science.wave.s_offset.intercept_uncorrected_se": se,
+    }
+    if pick_geonet is not None:
+        values["science.wave.s_pick.intercept_geonet"] = pick_geonet
+    if pick_sim is not None:
+        values["science.wave.s_pick.intercept_simulated"] = pick_sim
+    return values
+
+
+@pytest.mark.parametrize(
+    ("values", "failing", "judged_on"),
+    [
+        # 2026p742111: picks follow the simulated 28.5 km source, not GeoNet's 10 km hypocentre.
+        (_s_offsets(-3.64, 0.29, 3.91, 0.67), False, "simulated"),
+        # ... and the same with a 5 s clock error: the hypocentre bias must not hide it.
+        (_s_offsets(1.36, 5.29, 3.91, 0.67), True, "simulated"),
+        # GeoNet's hypocentre right, the simulated source misplaced: the corrected intercept counts.
+        (_s_offsets(0.2, -4.0, 0.3, -3.5), False, "GeoNet"),
+        (_s_offsets(5.2, 1.0, 0.3, -3.5), True, "GeoNet"),
+        # Hypocentres agree: both the same.
+        (_s_offsets(5.0, 5.1, 0.1, 0.1), True, "GeoNet"),
+        # Picks unknown: fail only when both intercepts do, with the same sign.
+        (_s_offsets(-3.64, 0.29, None, None), False, "both"),
+        (_s_offsets(5.0, -5.0, None, None), False, "both"),
+        (_s_offsets(5.0, 6.0, None, None), True, "both"),
+    ],
+)
+def test_timing_offset_judged_in_the_geometry_the_picks_follow(
+    values: dict[str, Any], failing: bool, judged_on: str
+) -> None:
+    con = database()
+    put(con, values)
+    e = only(run(checks.timing_offset, con))
+    assert e.failing is failing
+    assert judged_on in e.evidence["judged_on"]
+    assert (
+        e.evidence["metrics"]["science.wave.s_offset.intercept_uncorrected"]
+        == values["science.wave.s_offset.intercept_uncorrected"]
+    )
+
+
+def test_timing_offset_without_geonet_hypocentre_uses_uncorrected() -> None:
+    con = database()
+    values = _s_offsets(0.0, 6.0, None, None)
+    del values["science.wave.s_offset.intercept"]
+    put(con, values)
+    e = only(run(checks.timing_offset, con))
+    assert e.failing and e.value == 6.0
 
 
 @pytest.mark.parametrize(("lag", "failing"), [(0.03, False), (2.0, True)])

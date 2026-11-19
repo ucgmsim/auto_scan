@@ -19,8 +19,9 @@ science.cross_resolution_mismatch   high      two resolutions of one rupture dis
                                               velocity model, source discretisation, LF scaling, site mapping)
 science.period_dependent_bias       high      one half of the broadband (LF SW4 or HF stochastic) is off
 science.crossover_step              high      a step in the Fourier spectrum at bb.flo: LF/HF mismatch in bb_sim
-science.timing_offset               high      a clock/origin offset (distance-independent S onset error), or a
-                                              lag between resolutions
+science.timing_offset               high      a clock/origin offset (distance-independent S onset error, measured
+                                              from the hypocentre the observed picks follow), or a lag between
+                                              resolutions
 science.hv_ratio                    high      components swapped or mislabelled (vertical as horizontal)
 science.energy_before_p             medium    energy before the earliest possible P: a shifted or bad start
 science.truncated_waveforms         medium    records cut while still shaking: duration too short
@@ -84,6 +85,9 @@ CROSSOVER_MIN_N = 10
 
 # timing_offset: the S-onset offset regressed on distance has an intercept
 # (clock error) whose standard error is ~1-2 s with ~20-30 picks; 3 s and 3 se.
+# It is judged in the geometry the observed picks follow (GeoNet's hypocentre or
+# the simulated one): on 2026p742111 the correction to GeoNet's 10 km hypocentre,
+# 18 km above the simulated source, alone moved the intercept from +0.3 to -3.6 s.
 TIMING_INTERCEPT_BOUND_S = 3.0
 TIMING_SIGNIFICANCE = 3.0
 TIMING_MIN_N = 8
@@ -103,6 +107,9 @@ TRUNCATED_FRACTION_BOUND = 0.2
 # distance_trend / vs30_trend: slope per ln unit. The observed slope must be
 # significant (|t| > 3) and large, and the simulation-vs-GMM slope over every
 # site must have the same sign and be large too (natural range seen: +-0.4).
+# An IM with no GMM slope (PGA: the GMM records in the IM database hold no PGA) is reported but
+# never fails: on 2026p742111 PGA alone reached -0.84 +- 0.28 (t = 3.0) while the
+# GMM slopes of the other IMs had the opposite sign.
 TREND_OBS_BOUND = 0.7
 TREND_T = 3.0
 TREND_GMM_BOUND = 0.5
@@ -605,7 +612,9 @@ def _trend_failing(db: sqlite3.Connection, event_id: str, res: str, variable: st
         else:
             gmm = _m(db, event_id, res, f"science.gmm_residual.slope_lnvs30.{im}")
         obs_fail = abs(slope) > TREND_OBS_BOUND and abs(slope / se) > TREND_T
-        gmm_fail = gmm is None or (gmm * slope > 0 and abs(gmm) > TREND_GMM_BOUND)
+        # No GMM slope (always so for PGA: the GMM records hold no PGA) is no
+        # corroboration, so the observed slope alone, ordinary single-event misfit, cannot fail.
+        gmm_fail = gmm is not None and gmm * slope > 0 and abs(gmm) > TREND_GMM_BOUND
         per_im[im] = {"slope": _r(slope), "se": _r(se), "n": n, "gmm_slope": _r(gmm), "failing": obs_fail and gmm_fail}
         if obs_fail and gmm_fail:
             failing_ims.append(im)
@@ -658,7 +667,8 @@ def _trend_check(db: sqlite3.Connection, event_id: str, variable: str) -> Iterat
                     if variable == "lnrrup"
                     else "science.gmm_residual.slope_lnvs30.<IM>",
                 ],
-                "rule": f"|slope| > {TREND_OBS_BOUND}, |t| > {TREND_T}, GMM slope same sign and > {TREND_GMM_BOUND}",
+                "rule": f"|slope| > {TREND_OBS_BOUND}, |t| > {TREND_T}, GMM slope same sign and > {TREND_GMM_BOUND}"
+                " (an IM without a GMM slope, e.g. PGA, cannot fail)",
                 **persistence,
             },
             suspect_sources=(
@@ -882,6 +892,51 @@ def cross_resolution_mismatch(db: sqlite3.Connection, event_id: str) -> Iterator
         )
 
 
+def _timing_exceeds(intercept: float, se: float) -> bool:
+    """Whether an S-onset intercept is both large and significant."""
+    return abs(intercept) > TIMING_INTERCEPT_BOUND_S and abs(intercept) > TIMING_SIGNIFICANCE * se
+
+
+def _timing_intercept(db: sqlite3.Connection, event_id: str, res: str) -> tuple[float, float, str, bool] | None:
+    """The S-onset intercept to judge a run on: ``(intercept, se, geometry, failing)``, or None.
+
+    The intercept corrected to GeoNet's hypocentre is right when the observed
+    picks follow GeoNet's hypocentre, the uncorrected one (on the simulated
+    hypocentre) when they follow the simulated source. A clock error moves both
+    by the same amount; a disagreement between the hypocentres moves only one.
+    Requiring both to fail would hide a clock error smaller than that
+    disagreement, so the picks choose: the hypocentre whose pick intercept (the
+    picks are relative to GeoNet's origin time) is nearer 0 s. Without pick
+    intercepts both must fail, with the same sign; rows from before the
+    uncorrected intercept existed are judged on the corrected one alone.
+    """
+    estimates: dict[str, tuple[float, float]] = {}
+    for label, name in (("GeoNet hypocentre", "intercept"), ("simulated hypocentre", "intercept_uncorrected")):
+        intercept = _m(db, event_id, res, f"science.wave.s_offset.{name}")
+        se = _m(db, event_id, res, f"science.wave.s_offset.{name}_se")
+        if intercept is not None and se is not None:
+            estimates[label] = (intercept, se)
+    if not estimates:
+        return None
+    if len(estimates) == 1:
+        label, (intercept, se) = next(iter(estimates.items()))
+        return intercept, se, f"on the {label} only", _timing_exceeds(intercept, se)
+    pick_geonet = _m(db, event_id, res, "science.wave.s_pick.intercept_geonet")
+    pick_sim = _m(db, event_id, res, "science.wave.s_pick.intercept_simulated")
+    if pick_geonet is not None and pick_sim is not None:
+        label = "GeoNet hypocentre" if abs(pick_geonet) <= abs(pick_sim) else "simulated hypocentre"
+        intercept, se = estimates[label]
+        geometry = (
+            f"on the {label}, which the picks follow (pick intercepts: GeoNet {pick_geonet:+.2f} s,"
+            f" simulated {pick_sim:+.2f} s)"
+        )
+        return intercept, se, geometry, _timing_exceeds(intercept, se)
+    (a, sa), (b, sb) = estimates.values()
+    failing = _timing_exceeds(a, sa) and _timing_exceeds(b, sb) and a * b > 0
+    intercept, se = min(estimates.values(), key=lambda v: abs(v[0]))
+    return intercept, se, "on both hypocentres (the picks do not say which they follow)", failing
+
+
 @check
 def timing_offset(db: sqlite3.Connection, event_id: str) -> Iterator[Evaluation]:
     """A distance-independent offset of simulated S onsets from observed S picks, or a lag between resolutions.
@@ -901,11 +956,12 @@ def timing_offset(db: sqlite3.Connection, event_id: str) -> Iterator[Evaluation]
     """
     for res in run_resolutions(db, event_id):
         n = _m(db, event_id, res, "science.wave.s_offset.n") or 0
-        intercept = _m(db, event_id, res, "science.wave.s_offset.intercept")
-        se = _m(db, event_id, res, "science.wave.s_offset.intercept_se")
-        if n < TIMING_MIN_N or intercept is None or se is None:
+        if n < TIMING_MIN_N:
             continue
-        failing = abs(intercept) > TIMING_INTERCEPT_BOUND_S and abs(intercept) > TIMING_SIGNIFICANCE * se
+        judged = _timing_intercept(db, event_id, res)
+        if judged is None:
+            continue
+        intercept, se, geometry, failing = judged
         detail = _detail(db, event_id, res, "science.wave.s_offset.median") or {}
         yield Evaluation(
             check_id="science.timing_offset",
@@ -915,22 +971,44 @@ def timing_offset(db: sqlite3.Connection, event_id: str) -> Iterator[Evaluation]
             failing=failing,
             title="Simulated arrivals are offset in time from the observed ones (clock or origin-time error)",
             summary=f"{event_id} {res}: simulated minus observed S onset at zero distance {intercept:+.2f}+-{se:.2f} s"
-            f" (median over {n:.0f} stations {_m(db, event_id, res, 'science.wave.s_offset.median')} s, slope"
-            f" {_m(db, event_id, res, 'science.wave.s_offset.slope')} s/km).",
+            f" (judged {geometry}; corrected for GeoNet's hypocentre"
+            f" {_r(_m(db, event_id, res, 'science.wave.s_offset.intercept'), 2)} s, uncorrected on the simulated"
+            f" hypocentre {_r(_m(db, event_id, res, 'science.wave.s_offset.intercept_uncorrected'), 2)} s;"
+            f" median over {n:.0f} stations {_r(_m(db, event_id, res, 'science.wave.s_offset.median'), 2)} s).",
             kind="science",
             severity="high",
             value=intercept,
             threshold=TIMING_INTERCEPT_BOUND_S,
             evidence={
                 "metrics": {
-                    k: _m(db, event_id, res, f"science.wave.s_offset.{k}")
-                    for k in ("n", "median", "mad_sigma", "intercept", "intercept_se", "slope")
+                    f"science.wave.{k}": _m(db, event_id, res, f"science.wave.{k}")
+                    for k in (
+                        "s_offset.n",
+                        "s_offset.median",
+                        "s_offset.mad_sigma",
+                        "s_offset.intercept",
+                        "s_offset.intercept_se",
+                        "s_offset.slope",
+                        "s_offset.intercept_uncorrected",
+                        "s_offset.intercept_uncorrected_se",
+                        "s_offset.slope_uncorrected",
+                        "s_pick.intercept_geonet",
+                        "s_pick.intercept_simulated",
+                    )
                 },
-                "rule": f"|intercept| > {TIMING_INTERCEPT_BOUND_S} s and > {TIMING_SIGNIFICANCE} se",
+                "judged_on": geometry,
+                "rule": f"|intercept| > {TIMING_INTERCEPT_BOUND_S} s and > {TIMING_SIGNIFICANCE} se, for the intercept"
+                " in the geometry the observed picks follow (the hypocentre whose pick intercept is nearer 0 s);"
+                " both intercepts, with the same sign, when that is unknown",
+                "geonet_hypocentre": detail.get("geonet_hypocentre"),
+                "simulated_hypocentre": detail.get("simulated_hypocentre"),
                 "per_station": detail.get("per_station"),
                 "fit_outliers": detail.get("fit_outliers"),
+                "fit_outliers_uncorrected": detail.get("fit_outliers_uncorrected"),
                 "note": "t = 0 of the waveforms is the rupture start; observed picks are relative to GeoNet's origin"
-                " time (phase_arrival_table.csv); onsets are corrected for the hypocentre difference",
+                " time (phase_arrival_table.csv). The corrected intercept moves each onset to GeoNet's hypocentre"
+                f" at {detail.get('hypocentre_correction_vs_km_s')} km/s; when the picks follow the simulated source"
+                " instead, that correction alone shifts the intercept by seconds",
             },
             suspect_sources=["workflow", "realtime", "source-modelling", "hf-simulation"],
         )

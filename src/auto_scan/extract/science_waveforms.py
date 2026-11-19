@@ -24,11 +24,21 @@ science.wave.s_offset.median                        s      median of simulated m
                                                            removing the hypocentre difference
                                                            (``(R_sim - R_geonet) / VS_KM_S``)
 science.wave.s_offset.mad_sigma                     s      its robust spread
-science.wave.s_offset.intercept / .intercept_se     s      intercept of the offset regressed (OLS, outliers beyond
+science.wave.s_offset.intercept / _se               s      intercept of the offset regressed (OLS, outliers beyond
                                                            ``max(5 sigma, 3 s)`` dropped) on GeoNet hypocentral
                                                            distance: the distance-independent part, i.e. a clock
                                                            or origin-time error (a velocity error grows with distance)
 science.wave.s_offset.slope                         s/km   the slope of that regression
+science.wave.s_offset.intercept_uncorrected / _se   s      the same intercept without the hypocentre correction:
+                                                           the raw offsets regressed on the *simulated* hypocentral
+                                                           distance: the clock error when the picks follow the
+                                                           simulated source rather than GeoNet's hypocentre
+science.wave.s_offset.slope_uncorrected             s/km   the slope of that regression
+science.wave.s_pick.intercept_geonet                s      intercept of the observed S picks (relative to GeoNet's
+                                                           origin time) regressed on GeoNet hypocentral distance;
+                                                           ~0 when the picks follow GeoNet's hypocentre
+science.wave.s_pick.intercept_simulated             s      ... on simulated hypocentral distance; ~0 when the picks
+                                                           follow the simulated source
 science.crossover.step.median                       ln     median over stations (both horizontals) of the step in
                                                            the smoothed Fourier amplitude spectrum at ``bb.flo``:
                                                            a line fitted to ``ln FAS`` against ``ln f`` on
@@ -57,6 +67,14 @@ a_090)`` exceeds ``ONSET_FRACTION`` of its peak. The stochastic HF part carries
 no P wave, so the onset of a simulated broadband trace is its S wave; hence the
 comparison with observed S picks (the observed P is often invisible in the
 simulation at 0.5 Hz and below).
+
+The corrected intercept assumes the observed picks follow GeoNet's hypocentre.
+When GeoNet's and the simulated hypocentres differ (2026p742111: 10 km vs
+28.5 km deep), the correction ``(R_sim - R_geonet) / VS_KM_S`` is large near
+the source and small far away, which bends the line and moves its intercept by
+seconds with no clock error at all. The uncorrected intercept and the two pick
+intercepts let ``science.timing_offset`` judge the offset in the geometry the
+picks actually follow.
 """
 
 import math
@@ -306,31 +324,49 @@ def _s_offset(
             continue
         onset = _onset(np.hypot(clean[i, i000], clean[i, i090]), wf.dt)
         lat, lon = geometry["lat"].iloc[i], geometry["lon"].iloc[i]
-        correction, r_obs = 0.0, float("nan")
-        if geonet is not None and math.isfinite(lat) and math.isfinite(lon):
-            r_obs = math.hypot(float(io.haversine_km(geonet[0], geonet[1], lat, lon)), geonet[2])
+        r_obs = r_sim = float("nan")
+        if math.isfinite(lat) and math.isfinite(lon):
+            if geonet is not None:
+                r_obs = math.hypot(float(io.haversine_km(geonet[0], geonet[1], lat, lon)), geonet[2])
             if sim_hypo is not None:
                 r_sim = math.hypot(float(io.haversine_km(sim_hypo[0], sim_hypo[1], lat, lon)), sim_hypo[2])
-                correction = (r_sim - r_obs) / VS_KM_S
-        rows.append((station, onset - float(picks[station]) - correction, r_obs, onset, float(picks[station])))
+        correction = (r_sim - r_obs) / VS_KM_S if math.isfinite(r_sim - r_obs) else 0.0
+        pick = float(picks[station])
+        rows.append((station, onset - pick - correction, r_obs, onset, pick, onset - pick, r_sim))
     if not rows:
         return
     offsets = np.array([r[1] for r in rows])
     s = io.summarise(offsets)
-    # Bad picks (e.g. a P picked as S) are far outliers; keep them out of the line fit.
-    spread = max(OUTLIER_MADS * s.mad_sigma, OUTLIER_FLOOR_S) if math.isfinite(s.mad_sigma) else math.inf
-    inlier = np.abs(offsets - s.median) <= spread
     distances = np.array([r[2] for r in rows])
-    slope, _, intercept, intercept_se = io.ols_slope(distances[inlier], offsets[inlier])
+    slope, intercept, intercept_se, inlier = _robust_line(distances, offsets)
+    # The same offsets without the hypocentre correction, on the simulated geometry:
+    # right when the picks follow the simulated source rather than GeoNet's.
+    raw = np.array([r[5] for r in rows])
+    r_sims = np.array([r[6] for r in rows])
+    slope_raw, intercept_raw, intercept_raw_se, inlier_raw = _robust_line(r_sims, raw)
+    # Observed S picks against each hypocentral distance: picks are relative to
+    # GeoNet's origin time, so the hypocentre they follow puts S at ~0 s at zero distance.
+    obs_s = np.array([r[4] for r in rows])
+    _, _, pick_intercept_geonet, _ = io.ols_slope(distances[inlier], obs_s[inlier])
+    _, _, pick_intercept_sim, _ = io.ols_slope(r_sims[inlier_raw], obs_s[inlier_raw])
     detail = {
         "per_station": {
-            r[0]: {"sim_onset_s": round(r[3], 2), "obs_s_s": round(r[4], 2), "offset_s": round(r[1], 2)} for r in rows
+            r[0]: {
+                "sim_onset_s": round(r[3], 2),
+                "obs_s_s": round(r[4], 2),
+                "offset_s": round(r[1], 2),
+                "offset_uncorrected_s": round(r[5], 2),
+                "r_geonet_km": round(r[2], 1) if math.isfinite(r[2]) else None,
+                "r_sim_km": round(r[6], 1) if math.isfinite(r[6]) else None,
+            }
+            for r in rows
         },
         "onset_fraction": ONSET_FRACTION,
         "hypocentre_correction_vs_km_s": VS_KM_S,
         "simulated_hypocentre": sim_hypo,
         "geonet_hypocentre": geonet,
         "fit_outliers": [r[0] for r, keep in zip(rows, inlier, strict=True) if not keep],
+        "fit_outliers_uncorrected": [r[0] for r, keep in zip(rows, inlier_raw, strict=True) if not keep],
     }
     put = partial(_put, db, event_id, resolution)
     put("science.wave.s_offset.n", s.n, "1")
@@ -339,6 +375,21 @@ def _s_offset(
     put("science.wave.s_offset.intercept", intercept, "s")
     put("science.wave.s_offset.intercept_se", intercept_se, "s")
     put("science.wave.s_offset.slope", slope, "s/km")
+    put("science.wave.s_offset.intercept_uncorrected", intercept_raw, "s")
+    put("science.wave.s_offset.intercept_uncorrected_se", intercept_raw_se, "s")
+    put("science.wave.s_offset.slope_uncorrected", slope_raw, "s/km")
+    put("science.wave.s_pick.intercept_geonet", pick_intercept_geonet, "s")
+    put("science.wave.s_pick.intercept_simulated", pick_intercept_sim, "s")
+
+
+def _robust_line(distances: np.ndarray, offsets: np.ndarray) -> tuple[float, float, float, np.ndarray]:
+    """OLS line of offsets on distance, far outliers left out: ``(slope, intercept, intercept_se, inlier)``."""
+    s = io.summarise(offsets)
+    # Bad picks (e.g. a P picked as S) are far outliers; keep them out of the line fit.
+    spread = max(OUTLIER_MADS * s.mad_sigma, OUTLIER_FLOOR_S) if math.isfinite(s.mad_sigma) else math.inf
+    inlier = np.abs(offsets - s.median) <= spread
+    slope, _, intercept, intercept_se = io.ols_slope(distances[inlier], offsets[inlier])
+    return slope, intercept, intercept_se, inlier
 
 
 def _crossover(

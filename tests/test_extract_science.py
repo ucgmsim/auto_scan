@@ -21,6 +21,7 @@ import pytest
 import xarray as xr
 
 from auto_scan import db as scandb
+from auto_scan.checks import science as science_checks
 from auto_scan.extract import science, science_io, science_waveforms
 
 EVENT = "2026p000001"
@@ -110,9 +111,14 @@ def write_imdb(
 
 
 def write_observed(
-    directory: Path, stations: pd.DataFrame, obs: pd.DataFrame, bad: dict[str, dict[str, Any]] | None = None
+    directory: Path,
+    stations: pd.DataFrame,
+    obs: pd.DataFrame,
+    bad: dict[str, dict[str, Any]] | None = None,
+    source_depth_km: float = HYPO[2],
+    geonet_depth_km: float = HYPO[2],
 ) -> None:
-    """A flatfile directory: rotd50 table, phase arrivals and source table."""
+    """A flatfile directory: rotd50 table, phase arrivals (from a source at ``source_depth_km``) and source table."""
     directory.mkdir(parents=True, exist_ok=True)
     rows = []
     for sta, row in stations.iterrows():
@@ -141,7 +147,7 @@ def write_observed(
     pd.DataFrame(rows).to_csv(directory / "ground_motion_im_table_rotd50_flat.csv", index=False)
     phases = []
     for sta, row in stations.iterrows():
-        r_hyp = math.hypot(row["rrup"], HYPO[2])
+        r_hyp = math.hypot(row["rrup"], source_depth_km)
         phases.append(
             {
                 "record_id": f"{EVENT}_{sta}_HN_20",
@@ -154,14 +160,16 @@ def write_observed(
         )
     pd.DataFrame(phases).to_csv(directory / "phase_arrival_table.csv", index=False)
     pd.DataFrame(
-        [{"evid": EVENT, "lat": HYPO[0], "lon": HYPO[1], "depth": HYPO[2], "mag": 5.4, "mag_type": "ML"}]
+        [{"evid": EVENT, "lat": HYPO[0], "lon": HYPO[1], "depth": geonet_depth_km, "mag": 5.4, "mag_type": "ML"}]
     ).to_csv(directory / "earthquake_source_table.csv", index=False)
 
 
-def write_realisation(directory: Path, flo: float, half_width_deg: float = 1.5, magnitude: float = 5.0) -> None:
-    """A realisation with a single-plane source centred on HYPO, a square domain and bb.flo."""
+def write_realisation(
+    directory: Path, flo: float, half_width_deg: float = 1.5, magnitude: float = 5.0, depth: float = HYPO[2]
+) -> None:
+    """A realisation with a single-plane source centred on HYPO (at ``depth`` km), a square domain and bb.flo."""
     directory.mkdir(parents=True, exist_ok=True)
-    lat, lon, depth = HYPO
+    lat, lon = HYPO[:2]
     d = 0.01
     corners = [
         {"latitude": lat - d, "longitude": lon - d, "depth": (depth - 1) * 1000},
@@ -196,6 +204,7 @@ def synthetic_traces(
     shift_s: float = 0.0,
     decay_s: float = 3.0,
     vertical_gain: float = 0.33,
+    depth: float = HYPO[2],
 ) -> np.ndarray:
     """(station, component, time) acceleration: enveloped white noise from the S arrival."""
     rng = np.random.default_rng(seed)
@@ -204,7 +213,7 @@ def synthetic_traces(
     out = np.zeros((len(stations), 3, NT))
     shift = round(shift_s / DT)
     for i, (_, row) in enumerate(stations.iterrows()):
-        ts = math.hypot(row["rrup"], HYPO[2]) / 3.5
+        ts = math.hypot(row["rrup"], depth) / 3.5
         tau = np.clip(t - ts, 0, None)
         envelope = tau * np.exp(-tau / decay_s)
         envelope *= _model(row["rrup"], None) / (3 * envelope.max())
@@ -241,19 +250,27 @@ def make_event(
     trace_kwargs: dict[str, Any] | None = None,
     fine_shift_s: float = 0.0,
     bad_obs: dict[str, dict[str, Any]] | None = None,
+    source_depth_km: float = HYPO[2],
+    geonet_depth_km: float | None = None,
 ) -> Path:
-    """Write a synthetic event in the cache layout and return its directory."""
+    """Write a synthetic event in the cache layout and return its directory.
+
+    The simulated source, the observed picks and the waveforms' S arrivals are at
+    ``source_depth_km``; GeoNet's hypocentre (the flatfile's) is at ``geonet_depth_km``,
+    by default the same.
+    """
     event_dir = root / f"1-{EVENT}"
     stations = _stations()
     rng = np.random.default_rng(7)
     truth = _sim_table(stations)
     obs = truth * np.exp(0.3 * rng.standard_normal(truth.shape))
-    write_observed(event_dir / "observed", stations, obs, bad_obs)
-    write_realisation(event_dir, 1.0)
+    geonet_depth = source_depth_km if geonet_depth_km is None else geonet_depth_km
+    write_observed(event_dir / "observed", stations, obs, bad_obs, source_depth_km, geonet_depth)
+    write_realisation(event_dir, 1.0, depth=source_depth_km)
     for k, res in enumerate(resolutions):
         flo = science_io.RESOLUTION_HZ[res]
         run_dir = event_dir / res
-        write_realisation(run_dir, flo)
+        write_realisation(run_dir, flo, depth=source_depth_km)
         sim = _sim_table(stations, sim_scale) * np.exp(0.05 * rng.standard_normal(truth.shape))
         if k > 0:
             sim = sim * fine_scale
@@ -263,7 +280,9 @@ def make_event(
             kwargs = dict(trace_kwargs or {})
             if k > 0:
                 kwargs["shift_s"] = kwargs.get("shift_s", 0.0) + fine_shift_s
-            write_waveforms(run_dir, list(stations.index), synthetic_traces(stations, flo, **kwargs))
+            write_waveforms(
+                run_dir, list(stations.index), synthetic_traces(stations, flo, depth=source_depth_km, **kwargs)
+            )
     return event_dir
 
 
@@ -418,6 +437,24 @@ def test_timing_offset_and_early_energy(tmp_path: Path) -> None:
     assert metric(con, "science.wave.frac_early") == 0
     early = run_all(make_event(tmp_path / "b", trace_kwargs={"shift_s": -15.0}))
     assert metric(early, "science.wave.frac_early") > 0.5
+
+
+@pytest.mark.parametrize(("shift_s", "failing"), [(0.0, False), (5.0, True)])
+def test_timing_offset_with_geonet_hypocentre_too_shallow(tmp_path: Path, shift_s: float, failing: bool) -> None:
+    # 2026p742111: the picks follow the simulated 28 km source, GeoNet put it at 10 km.
+    event_dir = make_event(tmp_path, source_depth_km=28.0, geonet_depth_km=10.0, trace_kwargs={"shift_s": shift_s})
+    con = run_all(event_dir)
+    # The correction to GeoNet's hypocentre alone bends the line: about -4 s with no clock error.
+    assert metric(con, "science.wave.s_offset.intercept") == pytest.approx(shift_s - 4.0, abs=1.0)
+    assert metric(con, "science.wave.s_offset.intercept_uncorrected") == pytest.approx(shift_s, abs=0.5)
+    assert abs(metric(con, "science.wave.s_pick.intercept_simulated")) < 0.5
+    assert metric(con, "science.wave.s_pick.intercept_geonet") > 2.0
+    (evaluation,) = science_checks.timing_offset(con, EVENT)
+    assert evaluation.failing is failing
+    assert evaluation.value == pytest.approx(shift_s, abs=0.5)
+    assert "simulated hypocentre" in evaluation.evidence["judged_on"]
+    assert evaluation.evidence["geonet_hypocentre"][2] == pytest.approx(10.0)
+    assert evaluation.evidence["simulated_hypocentre"][2] == pytest.approx(28.0)
 
 
 def test_crossover_step_detects_hf_gain(tmp_path: Path) -> None:
