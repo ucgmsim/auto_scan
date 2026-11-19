@@ -69,6 +69,7 @@ def test_nothing_without_inputs() -> None:
         checks.cross_resolution_mismatch,
         checks.timing_offset,
         checks.source_mismatch,
+        checks.event_term,
         checks.station_coverage,
         checks.unsimulated_stations,
     ):
@@ -334,6 +335,92 @@ def test_source_mismatch(values: dict[str, Any], failing: bool) -> None:
     con = database()
     put(con, values, res="")
     assert only(run(checks.source_mismatch, con), "").failing is failing
+
+
+def _event_term(
+    hf: tuple[float, float | None, float | None],
+    lf: tuple[float, float | None, float | None] | None = None,
+    n: int = 19,
+) -> dict[str, Any]:
+    """Band medians ``(ln obs/sim, ln obs/gmm, ln gmm/sim)`` per band, over ``n`` stations."""
+    values: dict[str, Any] = {}
+    for band, triple, im in (("hf", hf, "PGA"), ("lf", lf, "pSA_3.0")):
+        if triple is None:
+            continue
+        obs_sim, obs_gmm, gmm_sim = triple
+        values[f"science.residual.band_median.{band}"] = (obs_sim, {"per_im_median": {im: obs_sim}, "flo_hz": 1.0})
+        values[f"science.residual.n.{im}"] = n
+        if obs_gmm is not None:
+            values[f"science.obs_gmm_residual.band_median.{band}"] = obs_gmm
+        if gmm_sim is not None:
+            values[f"science.gmm_residual.band_median.{band}"] = gmm_sim
+    return values
+
+
+def _event_source(con: sqlite3.Connection) -> None:
+    put(
+        con,
+        {
+            "science.source.mag_sim": 4.50,
+            "science.source.mag_obs": (5.29, {"mag_type": "ML"}),
+            "science.source.depth_diff_km": 18.4,
+            "science.source.hypo_offset_km": 7.3,
+        },
+        res="",
+    )
+
+
+@pytest.mark.parametrize(
+    ("hf", "lf", "failing"),
+    [
+        ((1.43, 1.03, 0.31), (0.79, 1.14, -0.41), True),  # 2026p742111: obs above sim and GMM, which agree
+        ((-2.12, -2.09, 0.07), None, True),  # 2026p778829: no LF band, HF alone
+        ((0.96, 0.26, 0.73), (0.79, 0.10, 0.49), False),  # 2026p806127: obs above sim but near the GMM
+        ((0.06, 0.21, -0.06), (0.28, 0.85, -0.44), False),  # 2026p866048: obs near sim
+        ((1.2, -1.1, 2.3), None, False),  # opposite signs
+        ((0.4, 0.3, 0.1), (-0.3, -0.2, -0.1), False),  # ordinary event terms
+        ((2.5, 0.8, 1.7), None, False),  # sim far from the GMM too: the simulation, not the source
+        ((1.4, 1.1, 0.3), (-1.2, -1.0, -0.2), False),  # bands disagree: spectral shape, not the source
+    ],
+)
+def test_event_term(hf: tuple[float, float, float], lf: tuple[float, float, float] | None, failing: bool) -> None:
+    con = database(resolutions=("1hz",))
+    _event_source(con)
+    put(con, _event_term(hf, lf))
+    e = only(run(checks.event_term, con), "")
+    assert e.failing is failing and e.severity == "high" and e.resolution == ""
+    assert "source-modelling" in e.suspect_sources
+    assert e.evidence["source"]["geonet_mag_type"] == "ML" and e.evidence["source"]["depth_diff_km"] == 18.4
+    if failing:
+        assert math.copysign(1, e.value or 0) == math.copysign(1, hf[0]) and abs(e.value or 0) > checks.LN2
+        assert "source" in e.summary and "GMM" in e.title
+        change = e.evidence["approximate_source_change"]["hf"]
+        assert change["delta_mw"][0] * hf[0] > 0 and change["moment_factor"][0] > 0
+
+
+def test_event_term_small_n_is_not_evaluated() -> None:
+    con = database(resolutions=("1hz",))
+    put(con, _event_term((1.43, 1.03, 0.31), (0.79, 1.14, -0.41), n=3))
+    assert run(checks.event_term, con) == []
+
+
+def test_event_term_without_gmm_comparison_is_not_evaluated() -> None:
+    con = database(resolutions=("1hz",))
+    # obs/sim far off but no obs-vs-GMM or GMM-vs-sim medians: nothing to tell the source from the simulation.
+    put(con, _event_term((2.0, None, None), (1.8, None, None)))
+    assert run(checks.event_term, con) == []
+
+
+@pytest.mark.parametrize(("n_bad", "failing"), [(1, False), (2, True), (3, True)])
+def test_event_term_one_evaluation_per_event(n_bad: int, failing: bool) -> None:
+    resolutions = ("0_25hz", "0_5hz", "1hz")
+    con = database(resolutions=resolutions)
+    for i, res in enumerate(resolutions):
+        bad = i >= len(resolutions) - n_bad
+        put(con, _event_term((1.3, 1.05, 0.2) if bad else (0.3, 0.2, 0.1)), res=res)
+    e = only(run(checks.event_term, con), "")
+    assert e.failing is failing and set(e.evidence["runs"]) == set(resolutions)
+    assert sum(r["failing"] for r in e.evidence["runs"].values()) == n_bad
 
 
 @pytest.mark.parametrize(("n", "frac", "failing"), [(3, 0.04, False), (30, 0.5, True), (5, 0.5, False)])

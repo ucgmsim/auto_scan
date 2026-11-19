@@ -29,6 +29,8 @@ science.vs30_trend                  medium    site amplification wrong or applie
 science.station_bias                medium    one station extreme the same way over >= 3 events: wrong site
                                               coordinates/Vs30, a bad instrument or a local model defect
 science.source_mismatch             high      hypocentre or magnitude not the one the CMT/GeoNet gave
+science.event_term                  high      observations > 2x off the simulation *and* the GMM the same way while
+                                              the two agree: the source description (Mw, depth, stress) is wrong
 science.station_coverage            low       many well-recorded stations outside the simulated domain
 science.unsimulated_stations        low       well-recorded stations inside the domain that were not simulated
                                               (missing from the workflow's station list)
@@ -125,6 +127,19 @@ SOURCE_OFFSET_KM = 30.0
 SOURCE_DEPTH_KM = 25.0
 SOURCE_MAG_SPREAD = 0.05
 SOURCE_MW_DIFF = 0.5
+
+# event_term: ln(obs/sim) and ln(obs/GMM) band medians both beyond ln 2 the same
+# way. Ordinary event terms are +-0.5 and the between-event sigma ~0.4-0.5, so
+# ln 2 (0.69) is ~1.5 of those; requiring the GMM to see it too removes the
+# simulation's own misfit (2026p806127: obs/sim +0.96, obs/GMM +0.26 passes).
+# On the scan database (Nov 2026) the bad automatic-CMT events sit at 0.81-2.12
+# (2026p786364 hf/lf -0.86/-0.81, 2026p824644 hf -0.89 are the closest), so
+# ln 2.5 (0.92) would miss them; 2026p866048 (obs/sim -0.15..+0.28) is far off.
+EVENT_TERM_BOUND = LN2
+# The median over n stations has a standard error ~1.25 * 0.6 / sqrt(n): 0.34 at 5.
+EVENT_TERM_MIN_N = 5
+# ln10 * 1.5: d ln M0 / d Mw.
+LN_M0_PER_MW = 1.5 * math.log(10.0)
 
 # station_coverage: a quarter of the well-recorded stations, and at least 10.
 COVERAGE_FRACTION = 0.25
@@ -1023,6 +1038,176 @@ def source_mismatch(db: sqlite3.Connection, event_id: str) -> Iterator[Evaluatio
             "note": "an ML-vs-Mw difference is not compared (ML is often well above Mw for NZ events)",
         },
         suspect_sources=["workflow", "source-modelling", "realtime"],
+    )
+
+
+def _event_term_band(db: sqlite3.Connection, event_id: str, res: str, band: str) -> dict[str, Any] | None:
+    """One band of one run for ``event_term``: the three band medians, n, and whether it agrees.
+
+    None when the band has no observed-vs-simulated or observed-vs-GMM median.
+    """
+    obs_sim = _band(db, event_id, res, "residual", band)
+    obs_gmm = _band(db, event_id, res, "obs_gmm_residual", band)
+    if obs_sim is None or obs_gmm is None:
+        return None
+    # ln(gmm/sim) on the same (station, IM) pairs; gmm_all (every site) only if that is missing.
+    gmm_sim = _band(db, event_id, res, "gmm_residual", band)
+    if gmm_sim is None:
+        gmm_sim = _band(db, event_id, res, "gmm_all", band)
+    ims = ((_detail(db, event_id, res, f"science.residual.band_median.{band}") or {}).get("per_im_median")) or {}
+    counts = [_m(db, event_id, res, f"science.residual.n.{im}") for im in ims or ["PGA"]]
+    n = max((c for c in counts if c is not None), default=0.0)
+    smaller = min(abs(obs_sim), abs(obs_gmm))
+    agrees = (
+        n >= EVENT_TERM_MIN_N
+        and obs_sim * obs_gmm > 0
+        and smaller > EVENT_TERM_BOUND
+        # The simulation is nearer the GMM than either is to the observations.
+        and (gmm_sim is None or abs(gmm_sim) < smaller)
+    )
+    return {
+        "ln_obs_over_sim": _r(obs_sim),
+        "ln_obs_over_gmm": _r(obs_gmm),
+        "ln_gmm_over_sim": _r(gmm_sim),
+        "n": n,
+        "agrees": agrees,
+        # Signed size of the shared offset: the smaller of the two, 0 if they disagree in sign.
+        "term": _r(math.copysign(smaller, obs_sim) if obs_sim * obs_gmm > 0 else 0.0),
+    }
+
+
+def _event_term_run(db: sqlite3.Connection, event_id: str, res: str) -> dict[str, Any] | None:
+    """One run for ``event_term``: its bands and its verdict, or None if no band has enough stations."""
+    bands = {b: v for b in ("hf", "lf") if (v := _event_term_band(db, event_id, res, b)) is not None}
+    usable = {b: v for b, v in bands.items() if v["n"] >= EVENT_TERM_MIN_N}
+    if not usable:
+        return None
+    agreeing = [v for v in usable.values() if v["agrees"]]
+    signs = {math.copysign(1.0, v["term"]) for v in agreeing}
+    direction = signs.pop() if len(signs) == 1 else 0.0
+    # A usable band clearly the other way makes it a spectral-shape problem (period_dependent_bias), not the source.
+    contradicted = any(
+        (v["ln_obs_over_sim"] or 0) * direction < -EVENT_TERM_BOUND
+        or (v["ln_obs_over_gmm"] or 0) * direction < -EVENT_TERM_BOUND
+        for v in usable.values()
+    )
+    failing = direction != 0.0 and not contradicted
+    strongest = max(usable.values(), key=lambda v: abs(v["term"]))
+    return {"bands": bands, "failing": failing, "direction": direction, "term": strongest["term"]}
+
+
+def _approx_mw_change(ln_obs_over_sim: float) -> dict[str, Any]:
+    """The moment and Mw change that would remove a residual, under omega-squared scaling (a rough guide)."""
+    # Below the corner frequency amplitude scales with M0; above it, at a fixed
+    # stress drop, the acceleration level scales with M0^(1/3).
+    low, high = ln_obs_over_sim / LN_M0_PER_MW, 3 * ln_obs_over_sim / LN_M0_PER_MW
+    return {
+        "delta_mw": [round(low, 2), round(high, 2)],
+        "moment_factor": [float(f"{math.exp(ln_obs_over_sim):.3g}"), float(f"{math.exp(3 * ln_obs_over_sim):.3g}")],
+    }
+
+
+@check
+def event_term(db: sqlite3.Connection, event_id: str) -> Iterator[Evaluation]:
+    """Observations far off both the simulation and the GMM the same way: the source description is wrong.
+
+    When the simulation and the empirical model agree and the observations sit
+    a large factor away from both, the simulation is doing what the GMM does for
+    the source it was given; the source (moment magnitude, depth, stress
+    parameter, from SeismicNow's automatic CMT) is the suspect, not wave
+    propagation or site response.
+
+    A run fails when, in at least one band with ``EVENT_TERM_MIN_N`` stations,
+    ``ln(obs/sim)`` and ``ln(obs/gmm)`` are both beyond ``EVENT_TERM_BOUND`` the
+    same way and ``|ln(gmm/sim)|`` is smaller than both, and no band is beyond
+    the bound the other way. The source is one per event, so the evaluation is
+    too (one finding, not one per resolution): the event fails when at least
+    half of its runs with enough stations fail, all the same way.
+
+    Parameters
+    ----------
+    db : sqlite3.Connection
+        The scan database.
+    event_id : str
+        The event.
+
+    Yields
+    ------
+    Evaluation
+        One per event with a run that has both comparisons over enough stations.
+    """
+    runs = {res: v for res in run_resolutions(db, event_id) if (v := _event_term_run(db, event_id, res)) is not None}
+    if not runs:
+        return
+    failing_runs = [res for res, v in runs.items() if v["failing"]]
+    directions = {runs[res]["direction"] for res in failing_runs}
+    failing = len(directions) == 1 and 2 * len(failing_runs) >= len(runs)
+    # Report the finest failing run, else the finest run.
+    shown = (failing_runs or list(runs))[-1]
+    run = runs[shown]
+    band_name, band = max(run["bands"].items(), key=lambda kv: (kv[1]["agrees"], abs(kv[1]["term"])))
+    obs_sim, obs_gmm, gmm_sim = band["ln_obs_over_sim"], band["ln_obs_over_gmm"], band["ln_gmm_over_sim"]
+    mag_sim = _m(db, event_id, "", "science.source.mag_sim")
+    mag_obs = _m(db, event_id, "", "science.source.mag_obs")
+    mag_type = (_detail(db, event_id, "", "science.source.mag_obs") or {}).get("mag_type", "")
+    depth = _m(db, event_id, "", "science.source.depth_diff_km")
+    offset = _m(db, event_id, "", "science.source.hypo_offset_km")
+    way = "above" if obs_sim > 0 else "below"
+    sim_vs_gmm = "n/a" if gmm_sim is None else f"x{math.exp(abs(gmm_sim)):.1f}"
+    yield Evaluation(
+        check_id="science.event_term",
+        event_id=event_id,
+        failing=failing,
+        title="Simulation agrees with the GMM but observations are far off both the same way: the simulated"
+        " source (magnitude) is suspect",
+        summary=f"{event_id} {shown} {band_name}: observations x{math.exp(abs(obs_sim)):.1f} {way} the simulation"
+        f" (ln {obs_sim:+.2f}) and x{math.exp(abs(obs_gmm)):.1f} {way} the GMM (ln {obs_gmm:+.2f}) over"
+        f" {band['n']:.0f} stations, while simulation and GMM agree to {sim_vs_gmm};"
+        f" {len(failing_runs)} of {len(runs)} runs fail (bound ln 2 = {EVENT_TERM_BOUND:.2f})."
+        f" Simulated Mw {_r(mag_sim, 2)}, GeoNet {mag_obs} {mag_type}; depth difference {_r(depth, 1)} km."
+        + (
+            " The source description (Mw, depth, stress parameter) is suspect, not propagation or site."
+            if failing
+            else ""
+        ),
+        kind="science",
+        severity="high",
+        value=run["term"],
+        threshold=EVENT_TERM_BOUND,
+        evidence={
+            "runs": runs,
+            "rule": f"per band with n >= {EVENT_TERM_MIN_N}: ln(obs/sim) and ln(obs/gmm) same sign, both beyond"
+            f" {EVENT_TERM_BOUND:.3f}, |ln(gmm/sim)| smaller than both; no band beyond the bound the other way;"
+            " the event fails when >= half its runs fail, the same way",
+            "metrics": [
+                "science.residual.band_median.{lf,hf}",
+                "science.obs_gmm_residual.band_median.{lf,hf}",
+                "science.gmm_residual.band_median.{lf,hf}",
+                "science.residual.n.<IM>",
+            ],
+            "source": {
+                "simulated_mw": _r(mag_sim, 2),
+                "geonet_magnitude": mag_obs,
+                "geonet_mag_type": mag_type,
+                "mw_minus_geonet": _r(_m(db, event_id, "", "science.source.mag_diff_obs"), 2),
+                "hypo_offset_km": _r(offset, 1),
+                "depth_diff_km": _r(depth, 1),
+                "hypocentre": _detail(db, event_id, "", "science.source.hypo_offset_km"),
+            },
+            "approximate_source_change": {
+                band: _approx_mw_change(v["ln_obs_over_sim"]) for band, v in run["bands"].items()
+            }
+            | {
+                "run": shown,
+                "note": "APPROXIMATE, a rough guide only: the change in Mw (and factor in M0) that would remove"
+                " ln(obs/sim), first if the band is below the corner frequency (amplitude ~ M0), second if above it"
+                " at a fixed stress drop (~ M0^(1/3)). A depth or stress-parameter error gives the same signature.",
+            },
+            "note": "Mw, mechanism and centroid come from SeismicNow's automatic CMT; a poor solution (low variance"
+            " reduction, Mw far from GeoNet's magnitude) is an input problem, not necessarily a code bug. GeoNet's"
+            " ML is often above Mw for NZ events, so mw_minus_geonet is NULL for ML.",
+        },
+        suspect_sources=["realtime", "source-modelling", "workflow"],
     )
 
 
