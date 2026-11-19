@@ -74,7 +74,8 @@ jobs:
         run: |
           install -d -m 700 ~/.config/rclone
           umask 077
-          printf '%s\n' "$RCLONE_CONFIG_TEXT" > ~/.config/rclone/rclone.conf
+          # The org secret is base64 (`base64 -w0 rclone.conf`), as nzcvm and NSHM2022DB use it.
+          printf '%s' "$RCLONE_CONFIG_TEXT" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
 
       - id: start
@@ -158,7 +159,8 @@ jobs:
         run: |
           install -d -m 700 ~/.config/rclone
           umask 077
-          printf '%s\n' "$RCLONE_CONFIG_TEXT" > ~/.config/rclone/rclone.conf
+          # The org secret is base64 (`base64 -w0 rclone.conf`), as nzcvm and NSHM2022DB use it.
+          printf '%s' "$RCLONE_CONFIG_TEXT" | base64 -d > ~/.config/rclone/rclone.conf
           chmod 600 ~/.config/rclone/rclone.conf
       # git clone of private ucgmsim repositories authenticates through gh, with GH_TOKEN.
       - run: gh auth setup-git

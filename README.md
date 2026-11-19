@@ -59,7 +59,7 @@ Every setting is one environment variable, read in `src/auto_scan/config.py`.
 
 | Name | Kind | What it is for |
 |---|---|---|
-| `RCLONE_CONFIG` | org secret (exists) | The text of an `rclone.conf` with the Dropbox remote. The workflow writes it to `~/.config/rclone/rclone.conf`. |
+| `RCLONE_CONFIG` | org secret (exists) | An `rclone.conf` with the `dropbox` remote, base64-encoded (`base64 -w0 rclone.conf`). The workflow decodes it to `~/.config/rclone/rclone.conf`. |
 | `CLAUDE_CODE_OAUTH_TOKEN` | org secret (exists) | Claude for the triage job, as in meta-ci-action. |
 | `SCAN_GH_TOKEN` | repository secret (create) | The `gh` token for `verify` and the triage: it reads, files, comments on and reopens issues in the other ucgmsim repositories and clones them. `github.token` can't, because it only covers this repository. |
 | `CYLC_MONITOR_READER_TOKEN` | repository secret (create) | The Cylc monitor's `cylc-reader` token. The scan reads the monitor's `jobs` view with it. |
