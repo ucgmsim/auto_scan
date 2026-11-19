@@ -1,7 +1,7 @@
 """Ingest new or changed runs: download, record, extract.
 
-For each event directory under ``results_url`` (the highest cycle when an event
-was simulated twice):
+For each event directory under ``results_url`` (the latest simulation when an
+event was simulated more than once, see "Re-runs" below):
 
 1. list its files (one ``rclone lsjson -R``) and download every run's
    ``manifest.json`` (one ``rclone copy``);
@@ -17,13 +17,26 @@ was simulated twice):
 
 The monitor's ``jobs`` view is copied whole once per call.
 
+Re-runs
+-------
+The database holds one simulation per event: the directory whose manifest was
+written last. When that directory changes (the event was run again in another
+cycle), every row derived from the old one is deleted first (runs, sources,
+metrics, residuals, timers and evaluations), so nothing of the old simulation is
+mixed into the new one, and the new one is ingested as a new event would be. Its
+findings are kept: a re-run that passes is how a fix is verified on the same
+earthquake. The meta row ``superseded:<event_id>`` lists the directories that
+are not scanned, so none is dropped silently.
+
 Late observations
 -----------------
 SeismicNow publishes flatfiles and SimDB ingests an event some time after the
 simulation finishes. The meta row ``observed:<event_id>`` holds JSON
 ``{"flatfiles": bool, "station_ims": bool, "checked_at": ISO time}`` from the
-last attempt. On every call, an event from the last ``OBSERVED_RETRY_DAYS``
-days whose row says either is missing is probed again (one request each); when
+last attempt. On every call, an event whose earthquake or simulation is from the
+last ``OBSERVED_RETRY_DAYS`` days (a backlog event is ingested by SimDB after it
+is simulated, however old the earthquake) and whose row says either is missing
+is probed again (one request each); when
 something new has appeared, the whole event is rescanned as if forced, because
 per-run extractors (station residuals) need the observations too.
 """
@@ -435,6 +448,10 @@ def scan_event(config: Config, db: sqlite3.Connection, event: results.EventDir, 
     }
     if not force and all(known.get(r) == hashes[r] for r in resolutions):
         return False
+    previous = db.execute("SELECT event_dir FROM events WHERE event_id = ?", (event.event_id,)).fetchone()
+    if previous is not None and previous["event_dir"] != event.name:
+        _forget_simulation(db, event.event_id)
+        _log(f"{event.name}: replaces {previous['event_dir']}, an earlier simulation of the event")
 
     results.download_runs(config, event.name, resolutions)
     observed = fetch_observed(config, event.event_id, event_dir)
@@ -453,6 +470,10 @@ def scan_event(config: Config, db: sqlite3.Connection, event: results.EventDir, 
         sha = _sha256(event_dir / resolution / "manifest.json")
         _record_run(db, event.event_id, resolution, manifests[resolution], sha)
     _set_observed_meta(db, event.event_id, observed)
+    db.execute(
+        "INSERT OR REPLACE INTO meta VALUES (?, ?)",
+        (f"superseded:{event.event_id}", json.dumps(sorted(event.superseded))),
+    )
     failures = _run_extractors(db, event.event_id, event_dir, resolutions)
     db.commit()
     _drop_large_files(event_dir)
@@ -468,6 +489,13 @@ def scan_event(config: Config, db: sqlite3.Connection, event: results.EventDir, 
             f" {len(failures)} extractor failure(s)"
         )
     return True
+
+
+def _forget_simulation(db: sqlite3.Connection, event_id: str) -> None:
+    """Delete every row derived from an event's simulation, keeping its findings."""
+    for table in ("runs", "run_sources", "metrics", "station_residuals", "sw4_timers", "evaluations"):
+        db.execute(f"DELETE FROM {table} WHERE event_id = ?", (event_id,))
+    db.execute("DELETE FROM meta WHERE key = ?", (f"observed:{event_id}",))
 
 
 def _with_cache(config: Config, cache_dir: Path) -> Config:
@@ -512,7 +540,9 @@ def _retry_observed(config: Config, db: sqlite3.Connection, events: list[results
     cutoff = (dt.datetime.now(dt.UTC) - dt.timedelta(days=OBSERVED_RETRY_DAYS)).isoformat()
     by_id = {event.event_id: event for event in events}
     rows = db.execute(
-        "SELECT event_id, event_dir FROM events WHERE origin_time >= ? ORDER BY origin_time", (cutoff,)
+        "SELECT e.event_id, e.event_dir FROM events e WHERE e.origin_time >= :cutoff"
+        " OR (SELECT max(r.written) FROM runs r WHERE r.event_id = e.event_id) >= :cutoff ORDER BY e.origin_time",
+        {"cutoff": cutoff},
     ).fetchall()
     for row in rows:
         event = by_id.get(row["event_id"])

@@ -1397,7 +1397,7 @@ def first_pickup(event_dir: Path, event_id: str) -> tuple[datetime, str] | None:
 
     The ``new_cmt`` xtrigger broadcasts ``new_cmt_event_id`` to the cycle that takes an
     event. A re-run of the event in a later cycle (a person removing the first cycle) is
-    not when it was picked up, and the collector keeps only the highest cycle's directory,
+    not when it was picked up, and the collector keeps only the latest simulation's directory,
     so the earliest broadcast in any uploaded ``log/scheduler/*.log`` is used.
 
     Parameters

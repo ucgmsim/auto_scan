@@ -128,14 +128,39 @@ with `subprocess`). If you truly need another, name it in your report.
 - An `open` finding that passes on 3 consecutive later events closes itself as
   `verified` with no issue (it was transient).
 
-A new finding is opened only when the check fails on the latest event evaluated,
+A new finding is opened only when the check fails on the latest event simulated,
 or on at least 2 of the last 5: old one-off failures in the backfill don't open
 findings nobody can act on.
+
+## Order of events, backlog events and re-runs
+
+Events are ordered by **when they were simulated** (the earliest `written` of
+their manifests, `db.SIMULATED_AT`), never by the earthquake's origin time,
+wherever the question is "which code ran": `metric_history` (per run, by that
+run's `written`), the findings lifecycle ("the latest event", "2 of the last 5",
+"3 later passes"), the suspect commit range and `verify`. Origin time is for
+display, and for the time from the earthquake to its results.
+
+A *backlog event* is an old earthquake put through the workflow later, by hand
+or while catching up after an outage. By the rule above it is simply the latest
+run: its history is the runs made before it, a failure on it can open a finding,
+and a pass on it counts towards a fix. `db.is_backlog` (an earthquake with a
+later origin was simulated first) marks it for the one check that measures
+reaction time, `ops.pickup_delay`, which skips it. It is retried for late SimDB
+and SeismicNow data for two weeks from its simulation, not from its origin.
+
+An event simulated more than once has one directory per cycle. The database
+holds one simulation per event, the one whose manifest was written last (cycle
+numbers restart when the workflow is reinstalled, so they can't decide). When a
+newer one appears, every row derived from the old one is deleted and the event
+is ingested afresh, so it moves to the end of every history; its findings stay,
+and a re-run that passes after a fix verifies it on the same earthquake. The
+directories left unscanned are listed in the meta row `superseded:<event_id>`.
 
 ## Suspect commit range
 
 For a finding, per suspect source: the commit in `run_sources` on the last event
-where the check passed, and on the first where it failed. The brief gives both as
+simulated where the check passed, and on the first where it failed. The brief gives both as
 a GitHub compare URL (`<url>/compare/<good>...<bad>`). No passing event means no
 range ("failing since the first event scanned").
 

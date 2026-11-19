@@ -242,6 +242,22 @@ def test_pickup_delay(scan: sqlite3.Connection) -> None:
     assert list(ops.pickup_delay(scan, "ev3")) == []
 
 
+def test_pickup_delay_skips_a_backlog_event(scan: sqlite3.Connection) -> None:
+    """An old earthquake run after a later one was not waiting to be picked up."""
+    add_job(scan, 2, "resolve_sources", submit="10:00:00", run="10:00:10", end="10:00:20")
+    set_metric(scan, "ev2", "", "ops.cycle_start_delay_s", 400 * 3600.0)
+    assert next(iter(ops.pickup_delay(scan, "ev2"))).failing
+    # ev1's run came first, but ev2's earthquake is the older one.
+    for cycle in (1, 2):
+        scan.execute(
+            "INSERT INTO runs (event_id, resolution, written) VALUES (?, '1hz', ?)",
+            (f"ev{cycle}", f"2026-11-{cycle:02d}T12:00:00+00:00"),
+        )
+    assert next(iter(ops.pickup_delay(scan, "ev2"))).failing
+    scan.execute("UPDATE events SET origin_time = '2020-01-01T00:00:00+00:00' WHERE event_id = 'ev2'")
+    assert list(ops.pickup_delay(scan, "ev2")) == []
+
+
 def test_parse_time() -> None:
     assert parse_time("2026-11-18T09:15:48+13:00") is not None
     assert parse_time("garbage") is None

@@ -27,7 +27,7 @@ from collections import defaultdict
 from collections.abc import Iterator
 from typing import Any
 
-from auto_scan.db import run_resolutions
+from auto_scan.db import SIMULATED_AT, is_backlog, run_resolutions, simulated_at
 from auto_scan.extract.perf import Job, event_cycle, read_jobs, split_task
 from auto_scan.registry import Evaluation, Severity, check
 
@@ -389,6 +389,10 @@ def retries_high(db: sqlite3.Connection, event_id: str) -> Iterator[Evaluation]:
 def missing_resolution(db: sqlite3.Connection, event_id: str) -> Iterator[Evaluation]:
     """An event lacks a resolution recent events have, though later events have run.
 
+    "Recent" and "later" are by when the events were simulated, so a backlog
+    event is held to what the workflow produced when it ran, not when the
+    earthquake happened.
+
     Parameters
     ----------
     db : sqlite3.Connection
@@ -401,16 +405,15 @@ def missing_resolution(db: sqlite3.Connection, event_id: str) -> Iterator[Evalua
     Evaluation
         One an expected resolution.
     """
-    row = db.execute("SELECT origin_time FROM events WHERE event_id = ?", (event_id,)).fetchone()
-    if row is None or row["origin_time"] is None:
+    at = simulated_at(db, event_id)
+    if at is None:
         return
-    origin = row["origin_time"]
     earlier = [
         r["event_id"]
         for r in db.execute(
-            "SELECT event_id FROM events WHERE origin_time < ? AND event_id IN (SELECT event_id FROM runs)"
-            " ORDER BY origin_time DESC LIMIT ?",
-            (origin, EXPECTED_WINDOW),
+            f"SELECT e.event_id, {SIMULATED_AT} AS at FROM events e"
+            " WHERE at < ? AND e.event_id IN (SELECT event_id FROM runs) ORDER BY at DESC LIMIT ?",
+            (at, EXPECTED_WINDOW),
         )
     ]
     counts: dict[str, int] = defaultdict(int)
@@ -423,8 +426,8 @@ def missing_resolution(db: sqlite3.Connection, event_id: str) -> Iterator[Evalua
     jobs = read_jobs(db, cycle) if cycle is not None else []
     for resolution in expected:
         later = db.execute(
-            "SELECT count(*) AS n FROM events JOIN runs USING (event_id) WHERE origin_time > ? AND resolution = ?",
-            (origin, resolution),
+            f"SELECT count(*) AS n FROM events e JOIN runs USING (event_id) WHERE {SIMULATED_AT} > ? AND resolution = ?",
+            (at, resolution),
         ).fetchone()["n"]
         missing = resolution not in have
         own = [job for job in jobs if split_task(job.name)[1] == resolution]
@@ -461,6 +464,9 @@ def missing_resolution(db: sqlite3.Connection, event_id: str) -> Iterator[Evalua
 def pickup_delay(db: sqlite3.Connection, event_id: str) -> Iterator[Evaluation]:
     """The workflow started the event's cycle long after the earthquake.
 
+    Not evaluated for a backlog event (``db.is_backlog``): one simulated after a
+    later earthquake was not waiting to be picked up.
+
     Parameters
     ----------
     db : sqlite3.Connection
@@ -473,6 +479,8 @@ def pickup_delay(db: sqlite3.Connection, event_id: str) -> Iterator[Evaluation]:
     Evaluation
         One for the event, when its origin and jobs are known.
     """
+    if is_backlog(db, event_id):
+        return
     delay = db.execute(
         "SELECT value FROM metrics WHERE event_id = ? AND resolution = '' AND metric = 'ops.cycle_start_delay_s'",
         (event_id,),

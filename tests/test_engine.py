@@ -249,3 +249,59 @@ def test_suspect_ranges_without_a_pass(db: sqlite3.Connection, outcomes: dict[st
     [sw4, _] = engine.suspect_ranges(db, findings(db)[0]["id"])
     assert (sw4["good_event"], sw4["good_commit"], sw4["bad_event"], sw4["bad_commit"]) == (None, None, ids[0], "c01")
     assert sw4["compare_url"] is None
+
+
+def simulate(db: sqlite3.Connection, event_id: str, day: int) -> None:
+    """Record that an event's runs were written on a day of November."""
+    db.execute("UPDATE runs SET written = ? WHERE event_id = ?", (f"2026-11-{day:02d}T00:00:00+00:00", event_id))
+    db.commit()
+
+
+def test_backlog_event_is_the_latest_run(db: sqlite3.Connection, outcomes: dict[str, bool]) -> None:
+    """An old earthquake simulated last opens a finding, and its range starts at the newest passing run."""
+    ids = add_events(db, 6)
+    # ids[0] is the oldest earthquake but the last simulated, on the newest code (c01 is its commit).
+    for day, event_id in enumerate(ids[1:] + ids[:1], start=1):
+        simulate(db, event_id, day)
+    outcomes.update(dict.fromkeys(ids, False))
+    outcomes[ids[0]] = True
+    engine.run_checks(db)
+
+    (finding,) = findings(db)
+    assert finding["first_event"] == ids[0] and finding["last_event"] == ids[0]
+    assert [r["event_id"] for r in engine.evaluations_for(db, CHECK, "1hz")] == ids[1:] + ids[:1]
+    sw4 = engine.suspect_ranges(db, finding["id"])[0]
+    assert (sw4["good_event"], sw4["good_commit"], sw4["bad_event"], sw4["bad_commit"]) == (
+        ids[5],
+        "c06",
+        ids[0],
+        "c01",
+    )
+
+
+def test_backlog_pass_counts_towards_self_close(db: sqlite3.Connection, outcomes: dict[str, bool]) -> None:
+    """Passes on old earthquakes simulated after the failure close an open finding."""
+    ids = add_events(db, 4)
+    for day, event_id in enumerate([ids[3], ids[0], ids[1], ids[2]], start=1):
+        simulate(db, event_id, day)
+    outcomes.update({ids[3]: True})
+    engine.run_checks(db)
+    assert findings(db)[0]["status"] == "open"
+    outcomes.update({ids[0]: False, ids[1]: False, ids[2]: False})
+    engine.run_checks(db)
+    assert findings(db)[0]["status"] == "verified"
+
+
+def test_finding_follows_a_reordered_history(db: sqlite3.Connection, outcomes: dict[str, bool]) -> None:
+    """A finding recorded in another order still spans all its failures."""
+    ids = add_events(db, 4)
+    outcomes.update({ids[0]: False, ids[1]: True, ids[2]: True, ids[3]: False})
+    engine.run_checks(db)
+    (finding,) = findings(db)
+    assert (finding["first_event"], finding["last_event"], finding["n_failing"]) == (ids[1], ids[2], 2)
+    # ids[1] was simulated after ids[2]: the finding's first event now comes after its last.
+    for day, event_id in enumerate([ids[0], ids[2], ids[1], ids[3]], start=1):
+        simulate(db, event_id, day)
+    engine.run_checks(db)
+    (finding,) = findings(db)
+    assert (finding["first_event"], finding["last_event"], finding["n_failing"]) == (ids[2], ids[1], 2)

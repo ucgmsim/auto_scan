@@ -57,26 +57,31 @@ def test_parse_event_dir() -> None:
         assert results.parse_event_dir(name) is None
 
 
-def test_list_events_keeps_highest_cycle(monkeypatch: pytest.MonkeyPatch) -> None:
-    names = [
-        "1-2026p660242",
-        "11-2026p866048",
-        "12-2026p866048",
-        "2-2026p764940",
-        "20261002T0000+1300-2026p728213",
-        "20261002T0000+1300-2026p728213-draft-300ch",
-        "builds",
-    ]
+def test_list_events_keeps_latest_simulation(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Times as rclone prints them: in the local zone, which changes with daylight saving.
+    manifests = {
+        "1-2026p660242/0_5hz/manifest.json": "2026-10-17T21:32:14+13:00",  # an old earthquake, run late
+        "2-2026p764940/0_5hz/manifest.json": "2026-10-11T16:57:50+13:00",
+        "11-2026p866048/1hz/manifest.json": "2026-11-18T03:05:57+13:00",
+        "12-2026p866048/0_5hz/manifest.json": "2026-11-18T09:40:32+13:00",
+        "12-2026p866048/1hz/manifest.json": "2026-11-18T15:03:35+13:00",
+        # Cycles restart when the workflow is reinstalled: the re-run has the lower number.
+        "9-2026p778829/0_5hz/manifest.json": "2026-09-20T10:00:00+12:00",
+        "4-2026p778829/0_5hz/manifest.json": "2026-11-03T20:21:23+13:00",
+        "20261002T0000+1300-2026p728213/1hz/manifest.json": "2026-10-02T10:00:00+13:00",
+    }
     calls = []
 
     def run(args: list[str]) -> str:
         calls.append(args)
-        return json.dumps([{"Name": name, "IsDir": True} for name in names])
+        return json.dumps([{"Path": path, "ModTime": modified} for path, modified in manifests.items()])
 
     monkeypatch.setattr(results, "run_rclone", run)
     events = results.list_events(Config(results_url="remote:/r"))
-    assert [e.name for e in events] == ["1-2026p660242", "2-2026p764940", "12-2026p866048"]
-    assert calls == [["lsjson", "--dirs-only", "remote:/r"]]
+    assert [e.name for e in events] == ["2-2026p764940", "1-2026p660242", "4-2026p778829", "12-2026p866048"]
+    assert [e.superseded for e in events] == [(), (), ("9-2026p778829",), ("11-2026p866048",)]
+    assert events[-1].written == "2026-11-18T02:03:35+00:00"
+    assert calls == [["lsjson", "-R", "--files-only", "--include", "/*/*/manifest.json", "remote:/r"]]
 
 
 def test_list_files_and_run_files(monkeypatch: pytest.MonkeyPatch) -> None:

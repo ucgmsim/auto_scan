@@ -8,6 +8,8 @@ realisation files and one directory per resolution. Only the files the scan
 reads are downloaded; the multi-GB waveform files never are.
 """
 
+import dataclasses
+import datetime as dt
 import json
 import re
 import shutil
@@ -43,11 +45,18 @@ class EventDir:
         The workflow's cycle point.
     event_id : str
         The GeoNet public id.
+    written : str
+        When its latest ``manifest.json`` was modified (rclone's ``ModTime``), or
+        ``""`` if unknown.
+    superseded : tuple of str
+        The event's other directories: earlier simulations of the same event.
     """
 
     name: str
     cycle: int
     event_id: str
+    written: str = ""
+    superseded: tuple[str, ...] = ()
 
 
 def run_rclone(args: list[str]) -> str:
@@ -93,8 +102,24 @@ def parse_event_dir(name: str) -> EventDir | None:
     return EventDir(match.group(0), int(match.group("cycle")), match.group("event_id"))
 
 
+def _utc(timestamp: str | None) -> str:
+    """rclone's ``ModTime`` in UTC to the second, so that the strings sort by time; ``""`` if unreadable."""
+    try:
+        moment = dt.datetime.fromisoformat(timestamp or "")
+    except ValueError:
+        return ""
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=dt.UTC)
+    return moment.astimezone(dt.UTC).isoformat(timespec="seconds")
+
+
 def list_events(config: Config) -> list[EventDir]:
-    """The event directories under ``results_url``, one per event.
+    """The event directories under ``results_url`` that hold a manifest, one per event.
+
+    An event simulated more than once has a directory per cycle. The one whose
+    manifest was written last is the event's current simulation; the others are
+    named in its ``superseded``. Cycle numbers can't decide this: they start
+    again from 1 when the workflow is reinstalled.
 
     Parameters
     ----------
@@ -104,15 +129,25 @@ def list_events(config: Config) -> list[EventDir]:
     Returns
     -------
     list of EventDir
-        By cycle. When an event was simulated in two cycles, only the highest is kept.
+        In the order they were simulated (by ``written``), so a scan ingests
+        events in the order every history is read in.
     """
-    entries = json.loads(run_rclone(["lsjson", "--dirs-only", config.results_url]))
-    latest: dict[str, EventDir] = {}
-    for entry in entries:
-        parsed = parse_event_dir(entry["Name"])
-        if parsed is not None and (parsed.event_id not in latest or parsed.cycle > latest[parsed.event_id].cycle):
-            latest[parsed.event_id] = parsed
-    return sorted(latest.values(), key=lambda event: event.cycle)
+    listing = run_rclone(["lsjson", "-R", "--files-only", "--include", "/*/*/manifest.json", config.results_url])
+    written: dict[str, str] = {}
+    for entry in json.loads(listing):
+        name = entry["Path"].split("/", 1)[0]
+        written[name] = max(written.get(name, ""), _utc(entry.get("ModTime")))
+    by_event: dict[str, list[EventDir]] = {}
+    for name, modified in written.items():
+        parsed = parse_event_dir(name)
+        if parsed is not None:
+            by_event.setdefault(parsed.event_id, []).append(dataclasses.replace(parsed, written=modified))
+    current = []
+    for directories in by_event.values():
+        directories.sort(key=lambda event: (event.written, event.cycle))
+        others = tuple(event.name for event in directories[:-1])
+        current.append(dataclasses.replace(directories[-1], superseded=others))
+    return sorted(current, key=lambda event: (event.written, event.cycle))
 
 
 def list_files(config: Config, event_dir: str) -> list[dict[str, Any]]:

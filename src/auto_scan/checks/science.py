@@ -43,7 +43,7 @@ from typing import Any
 
 import numpy as np
 
-from auto_scan.db import get_metric, metric_history, run_resolutions
+from auto_scan.db import SIMULATED_AT, get_metric, metric_history, run_resolutions, simulated_at
 from auto_scan.registry import Evaluation, Severity, check
 
 LN5 = math.log(5.0)
@@ -724,18 +724,19 @@ def station_bias(db: sqlite3.Connection, event_id: str) -> Iterator[Evaluation]:
         One per station of this event that has quality-ok residuals on at
         least ``STATION_MIN_EVENTS`` events up to this one.
     """
-    origin = db.execute("SELECT origin_time FROM events WHERE event_id = ?", (event_id,)).fetchone()
-    if origin is None:
+    at = simulated_at(db, event_id)
+    if at is None:
         return
+    # "Up to this one" is by when the events were simulated, like every other history.
     rows = db.execute(
-        """
+        f"""
         SELECT r.event_id, r.resolution, r.station, r.im, r.residual, e.origin_time
         FROM station_residuals r JOIN events e USING (event_id)
         WHERE r.quality_ok = 1 AND r.residual IS NOT NULL
-          AND (e.origin_time <= ? OR r.event_id = ?)
+          AND ({SIMULATED_AT} <= ? OR r.event_id = ?)
           AND r.station IN (SELECT station FROM station_residuals WHERE event_id = ? AND quality_ok = 1)
         """,
-        (origin[0], event_id, event_id),
+        (at, event_id, event_id),
     ).fetchall()
     if not rows:
         return

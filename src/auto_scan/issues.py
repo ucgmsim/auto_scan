@@ -29,6 +29,7 @@ from collections.abc import Callable, Sequence
 from typing import Any
 
 from auto_scan.config import Config
+from auto_scan.db import SIMULATED_AT
 
 Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 
@@ -131,18 +132,18 @@ def _describe_event(event: sqlite3.Row | None, event_id: str | None) -> str:
 
 
 def _evaluations(db: sqlite3.Connection, check_id: str, subject: str) -> list[sqlite3.Row]:
-    """Every evaluation of a (check, subject), oldest event first, with when each run was written."""
+    """Every evaluation of a (check, subject), earliest simulated event first, with when each run was written."""
     return db.execute(
-        """
+        f"""
         SELECT v.event_id, v.resolution, v.failing, v.value, v.threshold, v.summary, v.evaluated_at,
-               e.origin_time, e.cycle,
+               e.origin_time, e.cycle, {SIMULATED_AT} AS simulated_at,
                CASE WHEN v.resolution = ''
                     THEN (SELECT min(written) FROM runs r WHERE r.event_id = v.event_id)
                     ELSE (SELECT written FROM runs r WHERE r.event_id = v.event_id AND r.resolution = v.resolution)
                END AS written
         FROM evaluations v LEFT JOIN events e USING (event_id)
         WHERE v.check_id = ? AND v.subject = ?
-        ORDER BY e.origin_time, v.event_id, v.resolution
+        ORDER BY simulated_at IS NULL, simulated_at, v.event_id, v.resolution
         """,
         (check_id, subject),
     ).fetchall()

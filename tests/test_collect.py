@@ -1,7 +1,9 @@
 """Tests of the collector against a fake rclone remote (a local directory) and fake APIs."""
 
+import datetime as dt
 import io
 import json
+import os
 import re
 import shutil
 import sqlite3
@@ -31,6 +33,9 @@ def manifest(written: str = "2026-11-17T20:40:24+00:00", status: str = "succeede
         },
     }
 
+
+# An mtime well before the fixture's other files: the listing takes the latest manifest as current.
+OLDER = dt.datetime(2026, 11, 1, tzinfo=dt.UTC).timestamp()
 
 REALISATION = {
     "sources": {
@@ -88,8 +93,17 @@ class FakeRclone:
 
     def __call__(self, args: list[str]) -> str:
         self.calls.append(args)
-        if args[0] == "lsjson" and "--dirs-only" in args:
-            return json.dumps([{"Name": p.name, "IsDir": True} for p in self.path(args[-1]).iterdir() if p.is_dir()])
+        if args[0] == "lsjson" and "/*/*/manifest.json" in args:
+            root = self.path(args[-1])
+            return json.dumps(
+                [
+                    {
+                        "Path": str(p.relative_to(root)),
+                        "ModTime": dt.datetime.fromtimestamp(p.stat().st_mtime, dt.UTC).isoformat(),
+                    }
+                    for p in sorted(root.glob("*/*/manifest.json"))
+                ]
+            )
         if args[0] == "lsjson":
             root = self.path(args[-1])
             files = sorted(p for p in root.rglob("*") if p.is_file())
@@ -118,6 +132,7 @@ def setup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     (remote / event_dir / "realisation.srf").write_text("srf")
     (remote / f"11-{EVENT}" / "0_5hz").mkdir(parents=True)  # an older cycle of the same event
     (remote / f"11-{EVENT}" / "0_5hz" / "manifest.json").write_text("{}")
+    os.utime(remote / f"11-{EVENT}" / "0_5hz" / "manifest.json", (OLDER, OLDER))
     (remote / "3-2026p824644" / "0_5hz").mkdir(parents=True)  # no manifest yet: ignored
     (remote / "builds").mkdir()
     rclone = FakeRclone(remote)
@@ -301,11 +316,60 @@ def test_old_events_are_not_retried(setup, db: sqlite3.Connection) -> None:
     state["flatfiles"] = False
     collect.collect(config, db)
     db.execute("UPDATE events SET origin_time = '2020-01-01T00:00:00+00:00'")
+    db.execute("UPDATE runs SET written = '2020-01-02T00:00:00+00:00'")
     db.commit()
     state["flatfiles"] = True
     calls.clear()
     collect.collect(config, db)
     assert calls == []
+
+
+def test_backlog_event_is_retried(setup, db: sqlite3.Connection) -> None:
+    """An old earthquake simulated recently still waits for SimDB and SeismicNow."""
+    config, _remote, _rclone, state, calls = setup
+    state["flatfiles"] = False
+    collect.collect(config, db)
+    db.execute("UPDATE events SET origin_time = '2020-01-01T00:00:00+00:00'")
+    db.execute("UPDATE runs SET written = ?", (dt.datetime.now(dt.UTC).isoformat(timespec="seconds"),))
+    db.commit()
+    state["flatfiles"] = True
+    calls.clear()
+    collect.collect(config, db)
+    assert calls  # the extractors ran again: the event was rescanned
+
+
+def test_rerun_in_a_lower_cycle_replaces_the_event(setup, db: sqlite3.Connection, capsys) -> None:
+    """The latest manifest decides, not the cycle number, and nothing of the old simulation is left."""
+    config, remote, _rclone, _state, _calls = setup
+    collect.collect(config, db)
+    db.execute("INSERT INTO metrics VALUES (?, '1hz', 'perf.left_over', 1.0, NULL, NULL)", (EVENT,))
+    db.execute(
+        "INSERT INTO evaluations VALUES ('perf.x', '', ?, '1hz', 1, NULL, NULL, 'old', '2026-11-18T00:00:00+00:00')",
+        (EVENT,),
+    )
+    db.execute(
+        "INSERT INTO findings (check_id, subject, kind, severity, status, title, first_event, last_event)"
+        " VALUES ('perf.x', '', 'perf', 'low', 'filed', 't', ?, ?)",
+        (EVENT, EVENT),
+    )
+    db.commit()
+    # The workflow was reinstalled (cycles restart) and the event run again, at one resolution.
+    write_run(remote, f"2-{EVENT}", "0_5hz")
+    newer = dt.datetime.now(dt.UTC).timestamp() + 3600
+    os.utime(remote / f"2-{EVENT}" / "0_5hz" / "manifest.json", (newer, newer))
+    capsys.readouterr()
+    collect.collect(config, db)
+
+    assert f"2-{EVENT}: replaces 12-{EVENT}" in capsys.readouterr().err
+    (event,) = table(db, "events")
+    assert event["event_dir"] == f"2-{EVENT}" and event["cycle"] == 2
+    assert [r["resolution"] for r in table(db, "runs")] == ["0_5hz"]
+    assert {r["resolution"] for r in table(db, "run_sources")} == {"0_5hz"}
+    assert not db.execute("SELECT 1 FROM metrics WHERE metric = 'perf.left_over'").fetchall()
+    assert table(db, "evaluations") == []
+    assert len(table(db, "findings")) == 1  # the finding outlives the simulation it was found on
+    superseded = db.execute("SELECT value FROM meta WHERE key = ?", (f"superseded:{EVENT}",)).fetchone()
+    assert json.loads(superseded["value"]) == [f"11-{EVENT}", f"12-{EVENT}"]
 
 
 def test_one_event_failing_does_not_stop_others(setup, db: sqlite3.Connection, capsys) -> None:

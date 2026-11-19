@@ -30,7 +30,7 @@ import traceback
 from typing import Any
 
 from auto_scan import registry
-from auto_scan.db import run_resolutions
+from auto_scan.db import SIMULATED_AT, run_resolutions
 from auto_scan.registry import Evaluation
 
 LIVE_STATUSES = ("open", "filed", "fix_pending", "regressed")
@@ -87,7 +87,7 @@ def live_finding(db: sqlite3.Connection, check_id: str, subject: str) -> sqlite3
 
 
 def evaluations_for(db: sqlite3.Connection, check_id: str, subject: str) -> list[sqlite3.Row]:
-    """Every stored evaluation of a ``(check_id, subject)``, by event origin time.
+    """Every stored evaluation of a ``(check_id, subject)``, by when its event was simulated.
 
     Parameters
     ----------
@@ -101,25 +101,27 @@ def evaluations_for(db: sqlite3.Connection, check_id: str, subject: str) -> list
     Returns
     -------
     list of sqlite3.Row
-        The ``evaluations`` columns plus ``origin_time``, ordered by origin time,
-        then event id, then resolution. An event can have several rows, one per
-        resolution.
+        The ``evaluations`` columns plus ``origin_time`` and ``simulated_at``
+        (``db.SIMULATED_AT``), ordered by ``simulated_at``, then event id, then
+        resolution. An event can have several rows, one per resolution. The
+        order is of the runs, not of the earthquakes: a backlog event comes last.
     """
     return db.execute(
-        "SELECT v.*, e.origin_time FROM evaluations v LEFT JOIN events e USING (event_id)"
+        f"SELECT v.*, e.origin_time, {SIMULATED_AT} AS simulated_at"
+        " FROM evaluations v LEFT JOIN events e USING (event_id)"
         " WHERE v.check_id = ? AND v.subject = ?"
-        " ORDER BY e.origin_time IS NULL, e.origin_time, v.event_id, v.resolution",
+        " ORDER BY simulated_at IS NULL, simulated_at, v.event_id, v.resolution",
         (check_id, subject),
     ).fetchall()
 
 
 def _event_history(db: sqlite3.Connection, check_id: str, subject: str) -> list[dict[str, Any]]:
-    """Per event, in order: ``event_id``, ``origin_time``, ``failing`` (any resolution) and its rows."""
+    """Per event, in order: ``event_id``, ``simulated_at``, ``failing`` (any resolution) and its rows."""
     history: list[dict[str, Any]] = []
     for row in evaluations_for(db, check_id, subject):
         if not history or history[-1]["event_id"] != row["event_id"]:
             history.append(
-                {"event_id": row["event_id"], "origin_time": row["origin_time"], "failing": False, "rows": []}
+                {"event_id": row["event_id"], "simulated_at": row["simulated_at"], "failing": False, "rows": []}
             )
         history[-1]["failing"] = history[-1]["failing"] or bool(row["failing"])
         history[-1]["rows"].append(row)
@@ -150,9 +152,9 @@ def _store(db: sqlite3.Connection, evaluation: Evaluation, now: str) -> None:
 
 
 def _closed_boundary(db: sqlite3.Connection, check_id: str, subject: str) -> str | None:
-    """The origin time after which failures belong to a new finding: the latest closed one's end."""
+    """The simulation time after which failures belong to a new finding: the latest closed one's end."""
     row = db.execute(
-        "SELECT max(e.origin_time) AS boundary FROM findings f"
+        f"SELECT max({SIMULATED_AT}) AS boundary FROM findings f"
         " JOIN events e ON e.event_id = coalesce(f.verified_event, f.last_event)"
         " WHERE f.check_id = ? AND f.subject = ? AND f.status IN ('verified', 'dismissed')",
         (check_id, subject),
@@ -208,7 +210,7 @@ def _apply_lifecycle(
         if _recently_dismissed(db, check_id, subject, now):
             return
         boundary = _closed_boundary(db, check_id, subject)
-        recent = [h for h in history if boundary is None or (h["origin_time"] or "") > boundary]
+        recent = [h for h in history if boundary is None or (h["simulated_at"] or "") > boundary]
         window = recent[-OPEN_WINDOW:]
         if not window:
             return
@@ -248,12 +250,17 @@ def _apply_lifecycle(
         return
     ids = [h["event_id"] for h in history]
     start = ids.index(finding["first_event"]) if finding["first_event"] in ids else 0
+    # The history's order can change under a finding: an event is simulated again and moves
+    # to the end, or (once) the order itself went from origin time to simulation time. The
+    # finding then spans from whichever of its two ends now comes first.
+    if finding["last_event"] in ids:
+        start = min(start, ids.index(finding["last_event"]))
     since = history[start:]
     failing = [h for h in since if h["failing"]]
     changes: dict[str, Any] = {}
     if failing:
         last = failing[-1]["event_id"]
-        changes = {"last_event": last, "n_failing": len(failing)}
+        changes = {"first_event": failing[0]["event_id"], "last_event": last, "n_failing": len(failing)}
         if last in failures:
             changes |= _from_evaluation(failures[last])
             changes["severity"] = failures[last].severity
@@ -288,7 +295,9 @@ def run_checks(db: sqlite3.Connection, event: str | None = None) -> None:
     if event is None:
         events = [
             row["event_id"]
-            for row in db.execute("SELECT event_id FROM events ORDER BY origin_time IS NULL, origin_time, event_id")
+            for row in db.execute(
+                f"SELECT event_id, {SIMULATED_AT} AS at FROM events e ORDER BY at IS NULL, at, event_id"
+            )
         ]
     else:
         events = [row["event_id"] for row in db.execute("SELECT event_id FROM events WHERE event_id = ?", (event,))]
@@ -340,7 +349,7 @@ def suspect_ranges(db: sqlite3.Connection, finding_id: int) -> list[dict[str, An
     """The commit range of each suspect source of a finding.
 
     The bad event is the finding's first failing event; the good event is the
-    last event before it where the check passed. For each suspect source the
+    last event simulated before it where the check passed. For each suspect source the
     commit comes from ``run_sources`` at the resolution the evaluation ran on (or
     the event's finest run for an event-wide check).
 

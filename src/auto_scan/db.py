@@ -15,6 +15,15 @@ from typing import Any
 
 SCHEMA_VERSION = 1
 
+# When an event was simulated: its earliest manifest (the origin time only when no
+# run records one). This, not the origin time, orders events wherever the question
+# is "which code ran": an old earthquake run through the workflow later (a backlog
+# event) is old by origin but new by code. For a query whose events table is `e`.
+SIMULATED_AT = "coalesce((SELECT min(r.written) FROM runs r WHERE r.event_id = e.event_id), e.origin_time)"
+# The same for one run, falling back to the event's when there is no such run
+# (an event-wide metric, resolution ''). Binds :resolution.
+RUN_AT = f"coalesce((SELECT r.written FROM runs r WHERE r.event_id = e.event_id AND r.resolution = :resolution), {SIMULATED_AT})"
+
 SCHEMA = """
 -- One row a simulated event (a Cylc cycle).
 CREATE TABLE IF NOT EXISTS events (
@@ -225,7 +234,11 @@ def get_metric(db: sqlite3.Connection, event_id: str, resolution: str, metric: s
 def metric_history(
     db: sqlite3.Connection, metric: str, resolution: str, before_event: str | None = None
 ) -> list[tuple[str, float]]:
-    """A metric's values on earlier events, oldest first.
+    """A metric's values on earlier runs, oldest first.
+
+    "Earlier" is by when the run's manifest was written, not by the earthquake's
+    origin time: the history of a backlog event is the runs made before it, on
+    the code of the time.
 
     Parameters
     ----------
@@ -236,23 +249,71 @@ def metric_history(
     resolution : str
         The resolution, or ``""``.
     before_event : str, optional
-        Only events whose origin time is before this event's.
+        Only runs written before this event's run at ``resolution``.
 
     Returns
     -------
     list of (str, float)
-        ``(event_id, value)`` for every event with a non-NULL value, by origin time.
+        ``(event_id, value)`` for every event with a non-NULL value, by when the
+        run was written.
     """
     sql = (
-        "SELECT m.event_id, m.value FROM metrics m JOIN events e USING (event_id)"
-        " WHERE m.metric = ? AND m.resolution = ? AND m.value IS NOT NULL"
+        f"SELECT m.event_id, m.value, {RUN_AT} AS at FROM metrics m JOIN events e USING (event_id)"
+        " WHERE m.metric = :metric AND m.resolution = :resolution AND m.value IS NOT NULL"
     )
-    params: list[Any] = [metric, resolution]
+    params: dict[str, Any] = {"metric": metric, "resolution": resolution}
     if before_event is not None:
-        sql += " AND e.origin_time < (SELECT origin_time FROM events WHERE event_id = ?)"
-        params.append(before_event)
-    sql += " ORDER BY e.origin_time"
+        sql += f" AND at < (SELECT {RUN_AT} FROM events e WHERE e.event_id = :before)"
+        params["before"] = before_event
+    sql += " ORDER BY at, m.event_id"
     return [(row["event_id"], row["value"]) for row in db.execute(sql, params)]
+
+
+def simulated_at(db: sqlite3.Connection, event_id: str) -> str | None:
+    """When an event was simulated: what orders events as runs of the code.
+
+    Parameters
+    ----------
+    db : sqlite3.Connection
+        The scan database.
+    event_id : str
+        The event.
+
+    Returns
+    -------
+    str or None
+        When its earliest manifest was written (ISO 8601, UTC), else its origin
+        time, else None.
+    """
+    row = db.execute(f"SELECT {SIMULATED_AT} AS at FROM events e WHERE e.event_id = ?", (event_id,)).fetchone()
+    return None if row is None else row["at"]
+
+
+def is_backlog(db: sqlite3.Connection, event_id: str) -> bool:
+    """Whether an event was simulated out of order: after a later earthquake's simulation.
+
+    Such an event was not taken as it happened (it was run by hand, or caught up
+    after an outage), so the time from its origin to its simulation says nothing
+    about how fast the workflow reacts.
+
+    Parameters
+    ----------
+    db : sqlite3.Connection
+        The scan database.
+    event_id : str
+        The event.
+
+    Returns
+    -------
+    bool
+        True when an earthquake with a later origin time was simulated before this one.
+    """
+    row = db.execute(
+        f"SELECT 1 FROM events e, (SELECT origin_time, {SIMULATED_AT} AS at FROM events e WHERE e.event_id = ?) own"
+        f" WHERE e.origin_time > own.origin_time AND {SIMULATED_AT} < own.at LIMIT 1",
+        (event_id,),
+    ).fetchone()
+    return row is not None
 
 
 def run_resolutions(db: sqlite3.Connection, event_id: str) -> list[str]:
