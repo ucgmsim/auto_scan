@@ -23,9 +23,10 @@ Science
 - ``cmt.selected_few_stations``: the main solution rests on too few stations.
 - ``cmt.posterior_overconfident``: the misfit is many times what the data covariance
   expects but the posterior is not rescaled, so the reported uncertainty is too small.
-- ``cmt.runs_disagree``: the all_stations and drop_outliers_dev runs (the same
-  waveforms) give different mechanisms.
-- ``cmt.magnitude_offset``: Mw is far from GeoNet's magnitude.
+- ``cmt.runs_disagree``: the event's runs give different mechanisms.
+- ``cmt.magnitude_offset``: Mw is outside the range GeoNet's magnitude allows.
+- ``cmt.selected_isotropic``: the main solution, a full tensor, is largely isotropic.
+- ``cmt.no_signal``: the main solution fits noise.
 - ``cmt.outlier_drop_mismatch``: the stations dropped for drop_outliers_dev are not
   the ones the outlier flags name.
 - ``cmt.jackknife_unstable``: leaving one station out turns the main solution.
@@ -62,8 +63,6 @@ DROP_OUTLIERS_DEV = "drop_outliers_dev"
 # DESIGN.md: history once 5 earlier events exist, the median of the last 10.
 MIN_HISTORY = 5
 HISTORY_WINDOW = 10
-# 1.4826 MAD estimates a standard deviation for normal data.
-MAD_TO_SD = 1.4826
 
 # A deviatoric run's ISO% is zero up to rounding (4e-15 % on 2026p866048); 0.5 % is
 # far above rounding and far below any real isotropic part.
@@ -95,13 +94,22 @@ KAGAN_MAX_DEG = 30.0
 # Leaving one of ~30 stations out should not turn the solution further than two
 # catalogues disagree; 40 degrees leaves room for the few-station events.
 JACKKNIFE_KAGAN_MAX_DEG = 40.0
-# Mw - GeoNet M: NZ ML runs about 0.2-0.5 above Mw for small events (Ristau 2009);
-# a full unit before there is history is a scaling or unit bug (dyne.cm vs N.m is
-# 4.7 units, a Green's function factor of 10 is 0.67).
-MAGNITUDE_OFFSET_MAX = 1.0
-# Against history: 3 robust standard deviations, but never tighter than 0.3 units.
-MAGNITUDE_OFFSET_SDS = 3.0
-MAGNITUDE_OFFSET_FLOOR = 0.3
+# Between the main solution and any other run of the event: 60 degrees is a different
+# mechanism (2026p866048's good solution is 33 degrees from its 10-station azimuth run).
+RUN_KAGAN_MAX_DEG = 60.0
+# Mw - GeoNet M. NZ's ML runs about 0.2-0.5 above Mw for small events (Ristau 2009), and
+# the two well-fitted events here are at -0.39 and -0.55. Mw a half unit above GeoNet's
+# magnitude, or a whole unit below, is outside that; fixed, so a run of poor solutions
+# can't move it.
+MAGNITUDE_OFFSET_RANGE = (-1.0, 0.5)
+# A tectonic earthquake is a shear source. Regional full-tensor inversions through a 1-D
+# model carry spurious isotropic parts of 10-20 % (-9 and -10 % on the two well-fitted
+# events here); 30 % is beyond that.
+ISO_MAX = 30.0
+# VR under 0.1 with a reduced chi-square under 2: the synthetics explain almost nothing
+# and the noise covariance explains the rest (2026p830300: VR 0.011, chi-square 0.53).
+NO_SIGNAL_VR = 0.1
+NO_SIGNAL_CHI_SQUARE = 2.0
 # A third of the stations fitting worse than zero points at polarity, response or
 # Green's functions, not at a few noisy stations (8 of 34 on 2026p866048).
 NEGATIVE_VR_FRACTION_MAX = 1.0 / 3.0
@@ -593,7 +601,14 @@ def posterior_overconfident(db: sqlite3.Connection, event_id: str) -> Iterator[E
 
 @cmt_check
 def runs_disagree(db: sqlite3.Connection, event_id: str) -> Iterator[Evaluation]:
-    """``cmt.runs_disagree``: all_stations and drop_outliers_dev give different mechanisms.
+    """``cmt.runs_disagree``: the event's runs give different mechanisms or depths.
+
+    Two tests, on the runs that finished ``ok``. The main solution against every
+    other run (``RUN_KAGAN_MAX_DEG``): the runs invert the same earthquake, so a
+    different mechanism in any of them means the answer depends on the station
+    set or the constraint. And all_stations against drop_outliers_dev
+    (``KAGAN_MAX_DEG``, tighter): these two share their stations unless some
+    were dropped.
 
     Parameters
     ----------
@@ -605,39 +620,57 @@ def runs_disagree(db: sqlite3.Connection, event_id: str) -> Iterator[Evaluation]
     Yields
     ------
     Evaluation
-        One when both runs succeeded.
+        One for the event, when at least two runs succeeded.
     """
-    kagan = get_metric(db, event_id, DROP_OUTLIERS_DEV, "cmt.kagan_to_all_stations_deg")
-    if kagan is None:
+    selected = _selected_run(db, event_id)
+    ok = [run for run in _runs(db, event_id) if _ok(db, event_id, run)]
+    if selected is None or len(ok) < 2:
         return
-    if (
-        get_metric(db, event_id, ALL_STATIONS, "cmt.run_ok") != 1
-        or get_metric(db, event_id, DROP_OUTLIERS_DEV, "cmt.run_ok") != 1
-    ):
+    to_selected = {run: get_metric(db, event_id, run, "cmt.kagan_to_selected_deg") for run in ok if run != selected}
+    to_selected = {run: kagan for run, kagan in to_selected.items() if kagan is not None}
+    same_stations = None
+    if ALL_STATIONS in ok and DROP_OUTLIERS_DEV in ok:
+        same_stations = get_metric(db, event_id, DROP_OUTLIERS_DEV, "cmt.kagan_to_all_stations_deg")
+    if not to_selected and same_stations is None:
         return
-    mismatches = _detail(db, event_id, "", "cmt.outlier.drop_mismatches")
+    worst_run = max(to_selected, key=to_selected.__getitem__) if to_selected else None
+    worst = to_selected[worst_run] if worst_run else 0.0
+    # The value is the larger of the two tests, each over its own threshold.
+    ratios = [worst / RUN_KAGAN_MAX_DEG]
+    if same_stations is not None:
+        ratios.append(same_stations / KAGAN_MAX_DEG)
+    depths = {run: get_metric(db, event_id, run, "cmt.centroid_depth_km") for run in ok}
     yield _evaluation(
         "cmt.runs_disagree",
         event_id,
-        kagan > KAGAN_MAX_DEG,
-        "CMT runs on the same waveforms give different mechanisms",
-        f"Kagan angle {kagan:.1f} deg between all_stations and drop_outliers_dev.",
-        value=kagan,
-        threshold=KAGAN_MAX_DEG,
+        max(ratios) > 1.0,
+        "CMT runs of one event give different mechanisms",
+        f"Kagan angle to the main solution ({selected}): "
+        + ", ".join(f"{run} {kagan:.1f} deg" for run, kagan in to_selected.items())
+        + (f"; all_stations to drop_outliers_dev {same_stations:.1f} deg" if same_stations is not None else "")
+        + f"; centroid depths {', '.join(f'{run} {depth:g} km' for run, depth in depths.items() if depth is not None)}.",
+        value=max(ratios),
+        threshold=1.0,
         evidence={
-            "metric": "cmt.kagan_to_all_stations_deg",
-            "iso_percent_all_stations": get_metric(db, event_id, ALL_STATIONS, "cmt.iso_percent"),
-            "vr": {r: get_metric(db, event_id, r, "cmt.vr") for r in (ALL_STATIONS, DROP_OUTLIERS_DEV)},
-            "n_stations": {r: get_metric(db, event_id, r, "cmt.n_stations") for r in (ALL_STATIONS, DROP_OUTLIERS_DEV)},
-            "dropped_mismatches": mismatches,
-            "files": [f"{r}/results/solution_summary.csv" for r in (ALL_STATIONS, DROP_OUTLIERS_DEV)],
+            "selected_run": selected,
+            "kagan_to_selected_deg": to_selected,
+            "kagan_all_stations_to_drop_outliers_dev_deg": same_stations,
+            "thresholds_deg": {"any_run": RUN_KAGAN_MAX_DEG, "same_stations": KAGAN_MAX_DEG},
+            "centroid_depth_km": depths,
+            "vr": {run: get_metric(db, event_id, run, "cmt.vr") for run in ok},
+            "n_stations": {run: get_metric(db, event_id, run, "cmt.n_stations") for run in ok},
+            "iso_percent": {run: get_metric(db, event_id, run, "cmt.iso_percent") for run in ok},
+            "files": [f"{run}/results/solution_summary.csv" for run in ok],
         },
     )
 
 
 @cmt_check
 def magnitude_offset(db: sqlite3.Connection, event_id: str) -> Iterator[Evaluation]:
-    """``cmt.magnitude_offset``: Mw far from GeoNet's magnitude, or from the usual offset.
+    """``cmt.magnitude_offset``: Mw outside the range GeoNet's magnitude allows.
+
+    Against fixed bounds, not the history: a history of poor solutions would
+    make a poor one look usual.
 
     Parameters
     ----------
@@ -652,36 +685,129 @@ def magnitude_offset(db: sqlite3.Connection, event_id: str) -> Iterator[Evaluati
         One for the event.
     """
     offset = get_metric(db, event_id, "", "cmt.mw_minus_geonet")
-    if offset is None:
+    mw = get_metric(db, event_id, "", "cmt.mw")
+    geonet = get_metric(db, event_id, "", "cmt.geonet_magnitude")
+    if offset is None or mw is None or geonet is None:
         return
-    baseline, history = _baseline(db, "cmt.mw_minus_geonet", "", event_id)
-    if baseline is None:
-        deviation, threshold, basis = abs(offset), MAGNITUDE_OFFSET_MAX, "absolute"
-    else:
-        mad = statistics.median(abs(v - baseline) for _, v in history)
-        threshold = max(MAGNITUDE_OFFSET_SDS * MAD_TO_SD * mad, MAGNITUDE_OFFSET_FLOOR)
-        deviation, basis = abs(offset - baseline), "history"
+    low, high = MAGNITUDE_OFFSET_RANGE
+    excess = max(low - offset, offset - high)
     yield _evaluation(
         "cmt.magnitude_offset",
         event_id,
-        deviation > threshold,
+        excess > 0,
         "CMT Mw is far from GeoNet's magnitude",
-        f"Mw {get_metric(db, event_id, '', 'cmt.mw'):.2f} - GeoNet M {get_metric(db, event_id, '', 'cmt.geonet_magnitude'):.2f}"
-        f" = {offset:+.2f}" + (f", against a usual {baseline:+.2f}" if baseline is not None else "") + ".",
-        severity="high" if deviation > 2 * threshold else "medium",
-        value=deviation,
-        threshold=threshold,
+        f"Mw {mw:.2f} - GeoNet M {geonet:.2f} = {offset:+.2f}, outside {low:+.1f} to {high:+.1f}."
+        if excess > 0
+        else f"Mw {mw:.2f} - GeoNet M {geonet:.2f} = {offset:+.2f}.",
+        severity="high" if excess > 0.5 else "medium",
+        value=offset,
+        threshold=high if offset > high else low,
         evidence={
             "metric": "cmt.mw_minus_geonet",
             "offset": offset,
-            "basis": basis,
-            "baseline_median": baseline,
-            "history": history,
+            "allowed_range": [low, high],
             "geonet": _detail(db, event_id, "", "cmt.geonet_magnitude"),
             "selected": _detail(db, event_id, "", "cmt.mw"),
+            "history": metric_history(db, "cmt.mw_minus_geonet", "", before_event=event_id)[-HISTORY_WINDOW:],
             "files": ["event.csv", "cmt_solution.csv"],
         },
         suspects=[BAYESISOLA, CMT_SOLUTIONS],
+    )
+
+
+@cmt_check
+def selected_isotropic(db: sqlite3.Connection, event_id: str) -> Iterator[Evaluation]:
+    """``cmt.selected_isotropic``: the main solution is largely isotropic.
+
+    Parameters
+    ----------
+    db : sqlite3.Connection
+        The CMT database.
+    event_id : str
+        The event.
+
+    Yields
+    ------
+    Evaluation
+        One for the selected run, when it is a full tensor.
+    """
+    run = _selected_run(db, event_id)
+    if run is None or get_metric(db, event_id, run, "cmt.deviatoric") == 1:
+        return
+    iso = get_metric(db, event_id, run, "cmt.iso_percent")
+    if iso is None:
+        return
+    runs = [r for r in _runs(db, event_id) if _ok(db, event_id, r)]
+    yield _evaluation(
+        "cmt.selected_isotropic",
+        event_id,
+        abs(iso) > ISO_MAX,
+        "The main CMT solution is largely isotropic",
+        f"{run} (selected, full tensor): ISO {iso:+.0f} %, DC {get_metric(db, event_id, run, 'cmt.dc_percent') or float('nan'):.0f} %.",
+        resolution=run,
+        value=abs(iso),
+        threshold=ISO_MAX,
+        evidence={
+            "run": run,
+            "iso_percent": {r: get_metric(db, event_id, r, "cmt.iso_percent") for r in runs},
+            "dc_percent": {r: get_metric(db, event_id, r, "cmt.dc_percent") for r in runs},
+            "vr": {r: get_metric(db, event_id, r, "cmt.vr") for r in runs},
+            "deviatoric": {r: get_metric(db, event_id, r, "cmt.deviatoric") for r in runs},
+            "n_stations": get_metric(db, event_id, run, "cmt.n_stations"),
+            "file": f"{run}/results/solution_summary.csv",
+        },
+        suspects=[CMT_SOLUTIONS, BAYESISOLA],
+    )
+
+
+@cmt_check
+def no_signal(db: sqlite3.Connection, event_id: str) -> Iterator[Evaluation]:
+    """``cmt.no_signal``: the main solution explains almost none of the data, which the noise explains.
+
+    VR under ``NO_SIGNAL_VR`` while the misfit is within ``NO_SIGNAL_CHI_SQUARE``
+    of what the noise covariance expects: the band holds no signal above the
+    noise, and the tensor (and its Mw) is a fit to noise.
+
+    Parameters
+    ----------
+    db : sqlite3.Connection
+        The CMT database.
+    event_id : str
+        The event.
+
+    Yields
+    ------
+    Evaluation
+        One for the selected run.
+    """
+    run = _selected_run(db, event_id)
+    if run is None:
+        return
+    vr = get_metric(db, event_id, run, "cmt.vr")
+    chi2 = get_metric(db, event_id, run, "cmt.reduced_chi_square")
+    if vr is None or chi2 is None:
+        return
+    yield _evaluation(
+        "cmt.no_signal",
+        event_id,
+        vr < NO_SIGNAL_VR and chi2 < NO_SIGNAL_CHI_SQUARE,
+        "A CMT was posted for waveforms with no signal above the noise",
+        f"{run} (selected): VR {vr:.3f} with reduced chi-square {chi2:.2f}; posted as Mw"
+        f" {get_metric(db, event_id, '', 'cmt.mw') or float('nan'):.2f}.",
+        severity="high",
+        resolution=run,
+        value=vr,
+        threshold=NO_SIGNAL_VR,
+        evidence={
+            "run": run,
+            "vr": vr,
+            "reduced_chi_square": chi2,
+            "n_stations": get_metric(db, event_id, run, "cmt.n_stations"),
+            "geonet": _detail(db, event_id, "", "cmt.geonet_magnitude"),
+            "mw_minus_geonet": get_metric(db, event_id, "", "cmt.mw_minus_geonet"),
+            "files": [f"{run}/results/posterior_diagnostics.csv", f"{run}/figures/waveform_record_section.png"],
+        },
+        suspects=[CMT_SOLUTIONS, BAYESISOLA],
     )
 
 

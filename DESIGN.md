@@ -187,6 +187,17 @@ the first run) or re-applied since ingested (meta `cmt_applied:<event_id>`); any
 other event is reviewed by naming it. Nothing in the code knows about SeismicNow's
 older CMT layout: an event without `cmt_selection.csv` simply has no runs.
 
+Three layers, since a check only finds what someone thought to test. `checks.py`: one
+finding per problem across events (pipeline checks, and the product criteria, which use
+fixed references, never the history). `verdict.py`: `cmt.verdict` grades each posted
+solution from those criteria, with the event id as the finding's subject, and
+`cmt.population.*` reads the last 20 verdicts together. `observe.py`: the open-ended
+review, one Claude per event with the download and a sheet of numbers but no word of
+the checks; its observations (table `observations`, keyed by phenomenon, status `new`,
+`known`, `filed` or `dismissed`) are resolved by the triage, which proposes a new check
+for what nothing covered. Meta `explored:<event_id>` marks an event read
+(`explore_attempts:<event_id>` counts failed reviews, two at most).
+
 ## Hosting
 
 `scan.db` lives at `Config.state_url` (Dropbox), so the Datasette is a view that

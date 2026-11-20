@@ -194,6 +194,7 @@ def load_cmt_plugins() -> None:
     """Import the CMT review's extractors and checks."""
     importlib.import_module("auto_scan.cmt.extract")
     importlib.import_module("auto_scan.cmt.checks")
+    importlib.import_module("auto_scan.cmt.verdict")
 
 
 def load_plugins() -> None:

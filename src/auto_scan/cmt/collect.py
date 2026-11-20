@@ -94,6 +94,8 @@ def _forget(db: sqlite3.Connection, event_id: str) -> None:
     """Delete every row derived from an event's CMT, keeping its findings."""
     for table in ("runs", "run_sources", "metrics", "evaluations"):
         db.execute(f"DELETE FROM {table} WHERE event_id = ?", (event_id,))
+    # A new CMT of the event is read afresh by the open-ended review (auto_scan.cmt.observe).
+    db.execute("DELETE FROM meta WHERE key IN (?, ?)", (f"explored:{event_id}", f"explore_attempts:{event_id}"))
 
 
 def _event_row(event_id: str, listed: source.CmtEvent | None, event_dir: Path) -> dict[str, Any]:

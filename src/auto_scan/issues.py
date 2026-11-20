@@ -368,6 +368,7 @@ def brief(
         The scan database.
     max_findings : int, optional
         The most findings included, by default 5; the rest wait for the next run.
+        Zero or less: every one.
     config : Config, optional
         The settings, for the results and dashboard URLs; by default from the
         environment.
@@ -378,15 +379,19 @@ def brief(
     Returns
     -------
     str
-        The brief, or ``""`` when nothing is open.
+        The brief, or ``""`` when nothing is open. For the CMT review it ends with
+        the unresolved observations of the open-ended review, if any.
     """
     config = config or Config()
     findings = unfiled_open(db)
-    if not findings:
-        return ""
-    chosen = findings[: max(max_findings, 0)]
+    observations = ""
+    if review == "cmt":
+        from auto_scan.cmt import observe
+
+        observations = observe.brief_section(db)
+    chosen = findings if max_findings <= 0 else findings[:max_findings]
     if not chosen:
-        return ""
+        return observations
     if review == "cmt":
         where = (
             f"CMT results: `{config.seismicnow_api}/download/cmt_results?event_id=<event>&scope=all`."
@@ -403,7 +408,8 @@ def brief(
     ]
     if len(findings) > len(chosen):
         head += [f"{len(findings) - len(chosen)} more wait for the next run; leave them alone.", ""]
-    return "\n".join(head) + "\n" + "\n".join(_brief_one(db, config, finding, review) for finding in chosen)
+    text = "\n".join(head) + "\n" + "\n".join(_brief_one(db, config, finding, review) for finding in chosen)
+    return text + ("\n" + observations if observations else "")
 
 
 def link(db: sqlite3.Connection, finding_id: int, url: str) -> None:
