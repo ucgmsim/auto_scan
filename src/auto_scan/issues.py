@@ -41,6 +41,13 @@ KIND_ORDER = {"science": 0, "perf": 1, "ops": 2}
 PASSES_TO_VERIFY = {"science": 2}
 PASSES_TO_VERIFY_DEFAULT = 1
 REALTIME_REPO = "ucgmsim/realtime_simulation_workflow"
+# Sources with no run_sources row, whose repository is fixed: the Cylc workflow, and
+# the CMT review's two (cmt.db records no code versions; see auto_scan.cmt).
+FIXED_REPOS = {
+    "realtime": REALTIME_REPO,
+    "cmt_solutions": "ucgmsim/cmt_solutions",
+    "BayesISOLA": "AaronJR474/BayesISOLA",
+}
 ISSUE_URL = re.compile(r"https://github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)/issues/([0-9]+)")
 GITHUB_REPO = re.compile(
     r"(?:https?://|ssh://)?(?:[^@/]+@)?github\.com[:/]([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?/?$"
@@ -75,7 +82,7 @@ def _parse_time(value: str | None) -> datetime.datetime | None:
 
 
 def github_repo(url: str | None, source: str | None = None) -> str | None:
-    """The ``owner/repo`` a source's issues are filed in.
+    """The ``owner/repo`` of a source's code.
 
     Parameters
     ----------
@@ -83,16 +90,17 @@ def github_repo(url: str | None, source: str | None = None) -> str | None:
         The source's git URL (``run_sources.url``), e.g.
         ``https://github.com/ucgmsim/sw4.git`` or ``git@github.com:ucgmsim/sw4.git``.
     source : str, optional
-        The source's name; ``realtime`` (the Cylc workflow itself) maps to
-        ``ucgmsim/realtime_simulation_workflow`` whatever the URL.
+        The source's name; ``realtime`` (the Cylc workflow itself),
+        ``cmt_solutions`` and ``BayesISOLA`` map to their repositories
+        (``FIXED_REPOS``) whatever the URL.
 
     Returns
     -------
     str or None
         ``owner/repo``, or None if the URL is not a GitHub repository's.
     """
-    if source == "realtime":
-        return REALTIME_REPO
+    if source in FIXED_REPOS:
+        return FIXED_REPOS[source]
     if not url:
         return None
     match = GITHUB_REPO.match(url.strip())
@@ -124,11 +132,30 @@ def _describe_event(event: sqlite3.Row | None, event_id: str | None) -> str:
     """One line about an event: id, cycle, origin time, magnitude, location."""
     if event is None:
         return f"`{event_id}`" if event_id else "(none)"
-    magnitude = f"Mw {event['magnitude']:.1f}" if event["magnitude"] is not None else "Mw ?"
+    magnitude = f"Mw {event['magnitude']:.2f}" if event["magnitude"] is not None else "Mw ?"
+    cycle = f"cycle {event['cycle']}, " if event["cycle"] is not None else ""
     return (
-        f"`{event['event_id']}` (cycle {event['cycle']}, {event['origin_time']}, {magnitude}, "
+        f"`{event['event_id']}` ({cycle}{event['origin_time']}, {magnitude}, "
         f"{event['location'] or 'location unknown'}, dir `{event['event_dir']}`)"
     )
+
+
+def cmt_download_url(config: Config, event_id: str) -> str:
+    """SeismicNow's download of every CMT run of an event (tables, figures, reports, logs).
+
+    Parameters
+    ----------
+    config : Config
+        The settings (``seismicnow_api``).
+    event_id : str
+        The event.
+
+    Returns
+    -------
+    str
+        ``{seismicnow_api}/download/cmt_results?event_id=<id>&scope=all``.
+    """
+    return f"{config.seismicnow_api}/download/cmt_results?event_id={event_id}&scope=all"
 
 
 def _evaluations(db: sqlite3.Connection, check_id: str, subject: str) -> list[sqlite3.Row]:
@@ -181,7 +208,7 @@ def _latest_sources(db: sqlite3.Connection, event_id: str | None) -> dict[str, s
     return {row["source"]: row for row in rows}
 
 
-def _brief_one(db: sqlite3.Connection, config: Config, finding: sqlite3.Row) -> str:
+def _brief_one(db: sqlite3.Connection, config: Config, finding: sqlite3.Row, review: str = "simulation") -> str:
     """The brief's section for one finding."""
     lines: list[str] = []
     title = finding["title"]
@@ -200,6 +227,12 @@ def _brief_one(db: sqlite3.Connection, config: Config, finding: sqlite3.Row) -> 
         (
             f"- dashboard: {config.datasette_url}/-/dashboards/scan, "
             f"this finding: {config.datasette_url}/{config.scan_database}/findings/{finding['id']}"
+        )
+        if review != "cmt"
+        else (
+            f"- dashboard: {config.datasette_url}/-/dashboards/cmt, "
+            f"this finding: {config.datasette_url}/{config.cmt_database}/findings/{finding['id']}\n"
+            f"- CMT results of the latest failing event: {cmt_download_url(config, finding['last_event'])}"
         ),
         "",
         "### Summary",
@@ -259,11 +292,32 @@ def _brief_one(db: sqlite3.Connection, config: Config, finding: sqlite3.Row) -> 
         lines.append("(the check named none)")
     if ranges is None:
         lines.append("(commit ranges unavailable: engine.suspect_ranges failed)")
+    if review == "cmt":
+        lines.append(
+            "(SeismicNow's CMT results record no code versions, so there is no commit range: read the code on"
+            " the default branch, and its history around the events' times.)"
+        )
     lines.append("")
 
     lines += ["### Raw files", ""]
     event = _event(db, finding["last_event"])
-    if event is not None:
+    if review == "cmt":
+        failing_events = list(
+            dict.fromkeys(row["event_id"] for row in evaluations if row["failing"] and row["event_id"])
+        )
+        for event_id in failing_events[-3:]:
+            lines.append(f"- `{event_id}`: {cmt_download_url(config, event_id)}")
+        if not failing_events:
+            lines.append("(no failing event recorded)")
+        lines += [
+            "",
+            (
+                "Each is a zip: top level `README.txt`, `cmt_solution.csv`, `cmt_selection.csv`, `station_vr.csv`,"
+                " `event.csv`, `timings.csv`, `cmt_1d_run.log`; per run (`all_stations`, `azimuth`,"
+                " `drop_outliers_dev`) `results/*.csv`, `figures/*.png`, `log.txt`, `cmt_run.log` and HTML reports."
+            ),
+        ]
+    elif event is not None:
         base = f"{config.results_url.rstrip('/')}/{event['event_dir']}"
         lines.append(f"- event: `{base}/` (realisation.json, realisation.toml, realisation.geojson)")
         resolutions = sorted({row["resolution"] for row in evaluations if row["event_id"] == event["event_id"]} - {""})
@@ -303,7 +357,9 @@ def unfiled_open(db: sqlite3.Connection) -> list[sqlite3.Row]:
     return sorted(rows, key=lambda r: (SEVERITY_ORDER.get(r["severity"], 9), KIND_ORDER.get(r["kind"], 9)))
 
 
-def brief(db: sqlite3.Connection, max_findings: int = 5, config: Config | None = None) -> str:
+def brief(
+    db: sqlite3.Connection, max_findings: int = 5, config: Config | None = None, review: str = "simulation"
+) -> str:
     """The triage brief: markdown about the open findings no issue covers yet.
 
     Parameters
@@ -315,6 +371,9 @@ def brief(db: sqlite3.Connection, max_findings: int = 5, config: Config | None =
     config : Config, optional
         The settings, for the results and dashboard URLs; by default from the
         environment.
+    review : {"simulation", "cmt"}, optional
+        Which review's database ``db`` is: it decides where the brief says the
+        raw files are.
 
     Returns
     -------
@@ -328,16 +387,23 @@ def brief(db: sqlite3.Connection, max_findings: int = 5, config: Config | None =
     chosen = findings[: max(max_findings, 0)]
     if not chosen:
         return ""
+    if review == "cmt":
+        where = (
+            f"CMT results: `{config.seismicnow_api}/download/cmt_results?event_id=<event>&scope=all`."
+            f" Dashboard: {config.datasette_url}/-/dashboards/cmt."
+        )
+    else:
+        where = f"Results store (rclone): `{config.results_url}`. Dashboard: {config.datasette_url}/-/dashboards/scan."
     head = [
-        "# auto_scan triage brief",
+        f"# auto_scan {'CMT ' if review == 'cmt' else ''}triage brief",
         "",
         f"Generated {_now()}. {len(chosen)} of {len(findings)} open, unfiled finding(s), most urgent first.",
-        f"Results store (rclone): `{config.results_url}`. Dashboard: {config.datasette_url}/-/dashboards/scan.",
+        where,
         "",
     ]
     if len(findings) > len(chosen):
         head += [f"{len(findings) - len(chosen)} more wait for the next run; leave them alone.", ""]
-    return "\n".join(head) + "\n" + "\n".join(_brief_one(db, config, finding) for finding in chosen)
+    return "\n".join(head) + "\n" + "\n".join(_brief_one(db, config, finding, review) for finding in chosen)
 
 
 def link(db: sqlite3.Connection, finding_id: int, url: str) -> None:

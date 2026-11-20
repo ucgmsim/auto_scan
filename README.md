@@ -132,6 +132,38 @@ gh variable set DATASETTE_URL -R ucgmsim/auto_scan --body 'https://<your-dataset
 Run it by hand from the Actions tab. The inputs are `event` (rescan one event with
 `--force`), `triage` (off to skip Claude), `max-findings` and `model`.
 
+## The CMT review
+
+`.github/workflows/cmt.yml` reviews the automatic centroid moment tensors SeismicNow
+posts in the same way: `cmt_solutions`' `auto_cmt` runs BayesISOLA three times an event
+(`all_stations`, `azimuth`, `drop_outliers_dev`), and each posting is checked for
+scientific problems (the solution's internal consistency, the runs' agreement, the fit,
+the grid, the posterior, the magnitude against GeoNet's) and performance problems
+(`timings.csv`'s stage timings against their history). The checks are listed in
+`src/auto_scan/cmt/checks.py`'s docstring.
+
+- It keeps its own database, `cmt.db` (`AUTO_SCAN_CMT_DB`), in the same state store
+  as `scan.db`, with the same schema and findings lifecycle (`--review cmt` on any
+  subcommand). Each CMT run is a `runs` row whose `resolution` is the run's name.
+  `push` uploads it to `/-/scan/upload/cmt`, which makes it the Datasette's `cmt`
+  database, with its dashboard at `/-/dashboards/cmt` (cylc-monitor's
+  `server/cmt_views.sql` and `server/datasette.yaml`).
+- Every 30 minutes it reads SeismicNow's listing (`/earthquakes?has_cmt=true`) and
+  reviews each CMT applied since the last run, or re-applied after a re-run. The first
+  run takes nothing and only marks where to start from.
+- Older events are reviewed only when named: the workflow's `events` input
+  (space-separated ids, `force` to redo one), a `repository_dispatch` of type
+  `cmt-posted` with `client_payload.events`, or locally
+  `uv run auto-scan --review cmt collect <id> ... && uv run auto-scan --review cmt check`.
+  An event whose download has no `cmt_selection.csv` is skipped with a message.
+- The triage (`prompts/cmt_triage.md`) files every issue in `ucgmsim/cmt_solutions`,
+  assigned to Joel Ridden (`joelridden`) and mentioning him. A cause in BayesISOLA's
+  code is labelled `BayesISOLA`, since we can't file in AaronJR474/BayesISOLA.
+  `SCAN_GH_TOKEN` must therefore cover `ucgmsim/cmt_solutions` (Issues: read and write;
+  Contents: read).
+- SeismicNow's results record no code versions, so a CMT finding has no commit range:
+  the triage reads the default branches.
+
 `ci.yml` and `claude-review.yml` call meta-ci-action's shared workflows (`@v2`), as
 every ucgmsim repository does. `lefthook.yml` runs the same checks as git hooks
 (`uvx lefthook install`).
@@ -139,81 +171,42 @@ every ucgmsim repository does. `lefthook.yml` runs the same checks as git hooks
 ## Deploying the server side
 
 The scan's database and dashboard live on the Cylc monitor's Datasette, as a second
-database (`scan`) beside `cylc`. Datasette is pinned to 1.0a41 and
-datasette-dashboards to 0.8.0 there. `server/` holds three files:
+database (`scan`) beside `cylc`, and the CMT review's as a third (`cmt`). That
+server side is part of [cylc-monitor](https://github.com/ucgmsim/cylc-monitor), in its
+`server/`: the upload plugin (`plugins/scan_upload.py`), the views (`scan_views.sql`,
+`cmt_views.sql`) and the two dashboards (in `datasette.yaml`). Its README, sections
+"auto_scan's databases" and "Deploying the server", says how to deploy it and mint the
+token.
 
-- `server/plugins/scan_upload.py`: `POST /-/scan/upload`. It takes a gzipped
-  snapshot of `scan.db`, from the `scan-writer` actor only, up to 200 MB. It checks
+What auto_scan relies on:
+
+- `POST /-/scan/upload` (scan.db) and `POST /-/scan/upload/cmt` (cmt.db). Each takes a
+  gzipped snapshot, from the `scan-writer` actor only, up to 200 MB. The plugin checks
   that the snapshot is an SQLite database with a known `meta.schema_version`. Then, in
-  one transaction, it replaces every table of the `scan` database with the snapshot's
-  and remakes the views. It also registers the SQL aggregate `stdev()`, which the
-  views use.
-- `server/scan_views.sql`: the views the dashboard reads.
-- `server/scan_dashboard.yaml`: the dashboard, `/-/dashboards/scan`.
+  one transaction, it replaces every table of the target database with the snapshot's
+  and remakes its views. It also registers the SQL aggregate `stdev()`, which the views
+  use.
+- The dashboards, `/-/dashboards/scan` and `/-/dashboards/cmt`. Until a database's
+  first upload, its dashboard errors, because the views need the tables.
+- The `scan-writer` token, made on the server with
+  `python /app/make_token.py scan-writer` and stored as the repository secret
+  `AUTO_SCAN_WRITER_TOKEN` (above). Rotating the server's `DATASETTE_SECRET` revokes it
+  with all the others.
+- The server's URL, in the repository variable `DATASETTE_URL`.
 
-On the monitor's host, in its deployment directory (`~/cylc-monitor` in its README):
+To check a deployment, run the workflow once by hand. `push` logs
+`uploaded to .../-/scan/upload`, and `https://<your-datasette>/-/dashboards/scan` shows
+the scan. Run the CMT review workflow too: `/-/dashboards/cmt`.
 
-1. **Copy the files** into a subdirectory:
-   ```sh
-   mkdir -p ~/cylc-monitor/scan
-   scp server/plugins/scan_upload.py server/scan_views.sql server/scan_dashboard.yaml host:cylc-monitor/scan/
-   ```
-2. **docker-compose.yml**: serve a second database, and mount the plugin and the
-   views into the image's `/app`:
-   ```yaml
-   services:
-     datasette:
-       command: >
-         datasette serve /data/cylc.db /data/scan.db --create --config /app/datasette.yaml --plugins-dir /app/plugins
-         --host 0.0.0.0 --port 8001
-         --setting sql_time_limit_ms 3000 --setting max_returned_rows 5000
-         --setting force_https_urls 1
-       volumes:
-         - ./data:/data
-         - ./scan/scan_upload.py:/app/plugins/scan_upload.py:ro
-         - ./scan/scan_views.sql:/app/scan_views.sql:ro
-   ```
-   The only change to `command` is `/data/scan.db` after `/data/cylc.db`. `--create`
-   makes the empty file on first start. The plugin finds `scan_views.sql` at
-   `/app/scan_views.sql`, the directory above its own.
-3. **datasette.yaml**: let the writer in, and add the dashboard.
-   - Add `scan-writer` to the instance's `allow` list:
-     `allow: {id: [admin, cylc-reader, cylc-writer, scan-writer]}`. The plugin checks
-     the actor's id itself. Like `cylc-writer`, the token may otherwise only view the
-     instance.
-   - Paste `scan/scan_dashboard.yaml` under `plugins: datasette-dashboards:`, beside
-     `cylc:`. It is already indented for that place. In today's `datasette.yaml` that
-     section ends the file, so `cat scan/scan_dashboard.yaml >> datasette.yaml` does
-     it. Check the result with `python3 -c 'import yaml,sys; yaml.safe_load(open("datasette.yaml"))'`.
-
-   `cylc-reader` reads the scan database and its dashboard with no further change:
-   its token grants `view-database`, `view-table`, `view-query` and `execute-sql` on
-   every database. `admin` sees everything.
-4. **Restart**: `sudo docker compose up -d --build`. The datasette.yaml change needs
-   the rebuild, because the image copies it.
-5. **Mint the writer token** with the secret already in the container:
-   ```sh
-   sudo docker compose exec -T datasette sh -c \
-     'datasette create-token scan-writer --all view-instance --secret "$DATASETTE_SECRET"' > scan-writer.token
-   chmod 600 scan-writer.token
-   ```
-   Store it as the `AUTO_SCAN_WRITER_TOKEN` secret (above), then delete the file.
-   Alternatively, add `"scan-writer": ["scan-writer", "--all", "view-instance"]` to
-   `TOKENS` in the monitor's `server/make_token.py` and run
-   `python /app/make_token.py scan-writer`. Rotating `DATASETTE_SECRET` revokes this
-   token with all the others.
-6. **Check**: run the workflow once by hand. `push` logs `uploaded to .../-/scan/upload`,
-   and `https://<your-datasette>/-/dashboards/scan` shows the scan. Until the first
-   upload, the dashboard errors, because the views need the tables.
-
-To update the server side, copy the changed files and run `sudo docker compose
-restart datasette`. The views are remade at startup.
+A change to `db.py`'s tables, to a metric a view reads or to a dashboard is a change in
+cylc-monitor too. A new `SCHEMA_VERSION` needs the plugin's `SCHEMA_VERSIONS` and the
+views updated there first, or the server refuses the upload.
 
 ### Moving the Datasette
 
 The Datasette's address is one setting: the repository variable `DATASETTE_URL`.
-Deploy `server/` beside the monitor on the new host as above, mint a new writer token
-there, then:
+Deploy cylc-monitor's server on the new host, mint a new `scan-writer` token there,
+then:
 
 ```sh
 gh variable set DATASETTE_URL -R ucgmsim/auto_scan --body 'https://<new-datasette>'
@@ -244,8 +237,9 @@ module docstring's table. DESIGN.md has the rules. Briefly:
 
 Add a test with a small synthetic database. Then `uv run auto-scan check --force`
 locally shows what it would have found on the events so far. If the dashboard should
-show the new metric, add a column to a view in `server/scan_views.sql` and a chart to
-`server/scan_dashboard.yaml`. `metric_values` already shows any metric's history.
+show the new metric, add a column to a view in cylc-monitor's `server/scan_views.sql`
+and a chart to the `scan` dashboard in its `server/datasette.yaml`. `metric_values`
+already shows any metric's history.
 
 ## A finding's life
 

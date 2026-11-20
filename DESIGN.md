@@ -32,6 +32,7 @@ next events          the check passes on a run built after the fix -> `verified`
 | Cylc monitor | `GET {monitor_url}/{monitor_database}.json?sql=...&_shape=array`, `Authorization: Bearer <reader token>`; it answers 302, follow it | the `jobs` view (queue, run, cores, state, `job_err` tail) |
 | SimDB | `GET {simdb_api}/api/events/<id>/station-ims?dataset=realtime` (public; the default `simdb_api` already ends in `/api`, so the URL has `/api/api/`) | simulated IMs at real stations; only the finest resolution ingested |
 | SeismicNow | `GET {seismicnow_api}/download/flatfiles?event_id=<id>` (public) | a zip of NZGMDB-style flatfiles: observed IMs per component, `gmc_predictions.csv`, `snr_metadata.csv`, `fmax.csv`, `phase_arrival_table.csv`, `site_table.csv`, `earthquake_source_table.csv` |
+| SeismicNow CMT | `GET {seismicnow_api}/earthquakes?page=<n>&has_cmt=true&event_id=&min_magnitude=&max_magnitude=&min_depth=&max_depth=` (pages from 0, every key required) and `GET {seismicnow_api}/download/cmt_results?event_id=<id>&scope=all` (public) | the earthquakes with a posted CMT and `cmt_applied_at`; a zip of every run's result tables, figures, reports, logs and `timings.csv` (CMT review only) |
 
 Both quakecoresoft APIs need `Config.user_agent` (Cloudflare blocks urllib's).
 A real event's files are in the session scratchpad for reference (paths in each
@@ -73,7 +74,7 @@ src/auto_scan/
   checks/perf.py, checks/ops.py                                              [perf]
   publish.py    pull(config, db_path), push(config, db_path, datasette=True) [deploy]
   issues.py     brief(db, max_findings), link(db, id, url), dismiss(db, id, reason), verify(db)  [deploy]
-server/         Datasette plugin, views, dashboard                           [deploy]
+  cmt/          the CMT review: source.py, collect.py, extract.py, checks.py (see below)  [cmt]
 .github/workflows/, prompts/, README.md                                      [deploy]
 tests/test_<module>.py                                                       each owner
 ```
@@ -164,13 +165,38 @@ simulated where the check passed, and on the first where it failed. The brief gi
 a GitHub compare URL (`<url>/compare/<good>...<bad>`). No passing event means no
 range ("failing since the first event scanned").
 
+## The CMT review
+
+A second review over the same machinery: SeismicNow's automatic CMT inversions
+(`src/auto_scan/cmt/`, its package docstring has the table mapping). Its own
+database, `cmt.db`, has `scan.db`'s schema, so `engine`, `issues.verify`, `link`,
+`dismiss` and `publish` work unchanged; `--review cmt` on the CLI picks the
+database, the collector (`cmt.collect`), the checks (`registry.CMT_CHECKS`, added
+with `@cmt_check`; extractors with `@cmt_extractor`) and the brief's wording. A CMT
+run is a `runs` row (`resolution` = `all_stations`, `azimuth` or
+`drop_outliers_dev`); `runs.written` is when `cmt_solution.csv` was written (the
+download's zip time, else SeismicNow's `cmt_applied_at`), so the ordering rules above
+hold: a CMT computed later for an older earthquake is a backlog event. Check ids and
+metrics start `cmt.`. `run_sources` stays empty (no code versions are published), so
+there is no suspect commit range. `push` uploads it to `/-/scan/upload/cmt`, the
+Datasette's `cmt` database (views in cylc-monitor's `server/cmt_views.sql`, dashboard
+`/-/dashboards/cmt`).
+
+The schedule only takes CMTs applied after the watermark (meta `cmt_since`, set on
+the first run) or re-applied since ingested (meta `cmt_applied:<event_id>`); any
+other event is reviewed by naming it. Nothing in the code knows about SeismicNow's
+older CMT layout: an event without `cmt_selection.csv` simply has no runs.
+
 ## Hosting
 
 `scan.db` lives at `Config.state_url` (Dropbox), so the Datasette is a view that
 can move: set `AUTO_SCAN_DATASETTE_URL` (GitHub variable `DATASETTE_URL`) and
-redeploy `server/`. `push` POSTs the database to
-`{datasette_url}/-/scan/upload` with the writer token; the plugin replaces the
-`scan` database's tables in one transaction.
+deploy the server side there. That side (the upload plugin, the views and the
+dashboards) is part of ucgmsim/cylc-monitor's `server/`, deployed with the Cylc
+monitor. `push` POSTs the database to `{datasette_url}/-/scan/upload` (cmt.db to
+`/-/scan/upload/cmt`) with the `scan-writer` token (`AUTO_SCAN_WRITER_TOKEN`); the
+plugin replaces the database's tables in one transaction. A change to the tables
+(`SCHEMA_VERSION`) needs the plugin and views in cylc-monitor changed first.
 
 ## Style
 

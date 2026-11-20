@@ -4,6 +4,11 @@ checks, which turn rows into evaluations.
 A module under ``auto_scan.extract`` or ``auto_scan.checks`` registers its
 functions with the decorators here when it is imported; ``load_plugins`` imports
 every module of both packages.
+
+The CMT review (``auto_scan.cmt``) keeps its own lists, ``CMT_EXTRACTORS`` and
+``CMT_CHECKS``, filled by ``cmt_extractor`` and ``cmt_check`` and loaded by
+``load_cmt_plugins``: its checks run on ``cmt.db``, never on the simulations'
+``scan.db``, and the simulation checks never run on it.
 """
 
 import importlib
@@ -89,6 +94,10 @@ Check = Callable[[sqlite3.Connection, str], Iterable[Evaluation]]
 EXTRACTORS: list[Extractor] = []
 EVENT_EXTRACTORS: list[EventExtractor] = []
 CHECKS: list[Check] = []
+# cmt_extractor(db, event_id, event_dir): rows about one event's CMT inversion from
+# its unpacked SeismicNow download (cache/cmt/<event_id>), every run at once.
+CMT_EXTRACTORS: list[EventExtractor] = []
+CMT_CHECKS: list[Check] = []
 
 
 def extractor(function: Extractor) -> Extractor:
@@ -144,6 +153,47 @@ def check(function: Check) -> Check:
     """
     CHECKS.append(function)
     return function
+
+
+def cmt_extractor(function: EventExtractor) -> EventExtractor:
+    """Register a CMT extractor.
+
+    Parameters
+    ----------
+    function : EventExtractor
+        ``function(db, event_id, event_dir)``, where ``event_dir`` is the event's
+        unpacked CMT download. Same tolerance and idempotence as ``extractor``.
+
+    Returns
+    -------
+    EventExtractor
+        The function, unchanged.
+    """
+    CMT_EXTRACTORS.append(function)
+    return function
+
+
+def cmt_check(function: Check) -> Check:
+    """Register a CMT check, run on ``cmt.db`` only.
+
+    Parameters
+    ----------
+    function : Check
+        ``function(db, event_id)``, yielding ``Evaluation``s, as for ``check``.
+
+    Returns
+    -------
+    Check
+        The function, unchanged.
+    """
+    CMT_CHECKS.append(function)
+    return function
+
+
+def load_cmt_plugins() -> None:
+    """Import the CMT review's extractors and checks."""
+    importlib.import_module("auto_scan.cmt.extract")
+    importlib.import_module("auto_scan.cmt.checks")
 
 
 def load_plugins() -> None:

@@ -280,7 +280,7 @@ def _apply_lifecycle(
     _update(db, finding, changes, now)
 
 
-def run_checks(db: sqlite3.Connection, event: str | None = None) -> None:
+def run_checks(db: sqlite3.Connection, event: str | None = None, checks: list[registry.Check] | None = None) -> None:
     """Evaluate every check and update the findings.
 
     Parameters
@@ -289,8 +289,13 @@ def run_checks(db: sqlite3.Connection, event: str | None = None) -> None:
         The scan database; committed at the end.
     event : str, optional
         Only this event id. The lifecycle still reads each pair's whole history.
+    checks : list of Check, optional
+        The checks to run, by default every simulation check (``registry.CHECKS``,
+        after ``load_plugins``). The CMT review passes ``registry.CMT_CHECKS``.
     """
-    registry.load_plugins()
+    if checks is None:
+        registry.load_plugins()
+        checks = registry.CHECKS
     now = _now()
     if event is None:
         events = [
@@ -306,7 +311,7 @@ def run_checks(db: sqlite3.Connection, event: str | None = None) -> None:
     # Per pair, this run's latest failing evaluation of each event.
     touched: dict[tuple[str, str], dict[str, Evaluation]] = {}
     for event_id in events:
-        for check in registry.CHECKS:
+        for check in checks:
             try:
                 evaluations = list(check(db, event_id))
             except Exception:  # noqa: BLE001 - one check's bug must not stop the others

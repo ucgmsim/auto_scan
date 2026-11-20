@@ -262,3 +262,23 @@ def test_push_datasette_failure_is_a_warning(
 def test_push_missing_database(config: Config, remote: Path, tmp_path: Path) -> None:
     with pytest.raises(publish.StoreError, match="does not exist"):
         publish.push(config, tmp_path / "absent.db", runner=FakeRclone(remote))
+
+
+def test_push_cmt_store_uploads_to_its_route(config: Config, remote: Path, tmp_path: Path) -> None:
+    make_db(remote / "state" / "cmt.db", 1)
+    rclone = FakeRclone(remote)
+    db_path = tmp_path / "cmt.db"
+    publish.pull(config, db_path, runner=rclone, store=publish.CMT_STORE_NAME)
+    sent: list[urllib.request.Request] = []
+
+    def poster(request: urllib.request.Request) -> bytes:
+        sent.append(request)
+        return b'{"ok": true}'
+
+    publish.push(
+        config, db_path, runner=rclone, poster=poster, today=datetime.date(2026, 11, 19), store=publish.CMT_STORE_NAME
+    )
+    assert count_events(remote / "state" / "history" / "cmt-20261119.db") == 1
+    assert not (remote / "state" / "scan.db").exists()
+    (request,) = sent
+    assert request.full_url == "https://datasette.test/-/scan/upload/cmt"
