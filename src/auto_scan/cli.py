@@ -19,15 +19,24 @@ SeismicNow posted since the last run.
     auto-scan --review cmt collect 2026p866048 2026p862161 --force
     auto-scan --review cmt fetch 2026p866048 --out .ai/cmt/2026p866048   (unpack its results)
 
+and, for its open-ended review of each event (auto_scan.cmt.observe):
+
+    auto-scan --review cmt unexplored                  the events no reviewer has read, as JSON
+    auto-scan --review cmt sheet EVENT [--out F]       the numbers a reviewer gets with the download
+    auto-scan --review cmt observe EVENT FILE          record a reviewer's observations (JSON)
+    auto-scan --review cmt resolve KEY STATUS WHY      known, filed or dismissed, for every event with KEY
+
 Each subcommand is one function in the module that owns it; this file only parses.
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
 
 from auto_scan import collect, engine, issues, publish, registry
 from auto_scan.cmt import collect as cmt_collect
+from auto_scan.cmt import observe as cmt_observe
 from auto_scan.cmt import source as cmt_source
 from auto_scan.config import Config
 from auto_scan.db import connect
@@ -67,12 +76,23 @@ def main(argv: list[str] | None = None) -> int:
     command.add_argument("event", nargs="?", help="only this event id")
     command.add_argument("--force", action="store_true", help="unused; kept for symmetry with collect")
     commands.add_parser("verify")
+    commands.add_parser("unexplored")
+    sheet = commands.add_parser("sheet")
+    sheet.add_argument("event")
+    sheet.add_argument("--out", type=Path, help="write the sheet here instead of stdout")
+    observe_command = commands.add_parser("observe")
+    observe_command.add_argument("event")
+    observe_command.add_argument("file", type=Path, help="the reviewer's observations, a JSON list")
+    resolve = commands.add_parser("resolve")
+    resolve.add_argument("key")
+    resolve.add_argument("status", choices=sorted(cmt_observe.RESOLVED))
+    resolve.add_argument("resolution", help="the check or issue URL that covers it, or why it is no problem")
     fetch = commands.add_parser("fetch")
     fetch.add_argument("event")
     fetch.add_argument("--out", type=Path, required=True, help="directory to unpack into (replaced)")
     brief = commands.add_parser("brief")
     brief.add_argument("--out", type=Path, help="write the brief here instead of stdout")
-    brief.add_argument("--max-findings", type=int, default=5)
+    brief.add_argument("--max-findings", type=int, default=5, help="0: every open finding")
     link = commands.add_parser("link")
     link.add_argument("finding", type=int)
     link.add_argument("url")
@@ -121,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
         else:
             engine.run_checks(db, event=event)
 
+    if args.command in ("unexplored", "sheet", "observe", "resolve") and not cmt:
+        parser.error(f"{args.command} is for --review cmt")
     if args.command == "fetch":
         if not cmt:
             parser.error("fetch is for --review cmt; the simulations' files are in the rclone results store")
@@ -142,6 +164,20 @@ def main(argv: list[str] | None = None) -> int:
             run_checks(args.event)
         elif args.command == "verify":
             issues.verify(db)
+        elif args.command == "unexplored":
+            print(json.dumps(cmt_observe.unexplored(db)))
+        elif args.command == "sheet":
+            text = cmt_observe.sheet(db, args.event)
+            if args.out:
+                args.out.write_text(text)
+            else:
+                sys.stdout.write(text)
+        elif args.command == "observe":
+            count = cmt_observe.import_observations(db, args.event, args.file)
+            print(f"auto-scan: cmt: {args.event}: {count} observation(s) recorded", file=sys.stderr)
+        elif args.command == "resolve":
+            count = cmt_observe.resolve(db, args.key, args.status, args.resolution)
+            print(f"auto-scan: cmt: {args.key}: {count} observation(s) {args.status}", file=sys.stderr)
         elif args.command == "brief":
             text = issues.brief(db, max_findings=args.max_findings, review=args.review)
             if args.out:

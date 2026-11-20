@@ -164,6 +164,35 @@ the grid, the posterior, the magnitude against GeoNet's) and performance problem
 - SeismicNow's results record no code versions, so a CMT finding has no commit range:
   the triage reads the default branches.
 
+It looks at each posting in three ways, because a check only finds what someone thought
+to test:
+
+- **Checks** (`src/auto_scan/cmt/checks.py`): one finding per problem, across events.
+  Pipeline checks aim at a kind of bug or cost. Product criteria ask whether the main
+  solution can be trusted: stations, fit, signal, magnitude, grid edge, jackknife,
+  station misfit, agreement between runs, isotropic share. They compare with fixed
+  references, not with the history, so a run of poor solutions can't become the norm.
+- **Verdicts** (`src/auto_scan/cmt/verdict.py`): each posted solution is graded
+  `good`, `doubtful` or `reject` from the product criteria. A rejected one is a finding
+  of its own, `cmt.verdict` with the event as its subject, so one event's dismissal
+  never speaks for another. Three `cmt.population.*` checks then look at the last 20
+  verdicts together: the share rejected, the share of largely isotropic full tensors,
+  and whether Mw is inflated where the fit is poor.
+- **The open-ended review** (`src/auto_scan/cmt/observe.py`, the workflow's `explore`
+  job): one Claude per event not yet read, with the whole download (figures included)
+  and a sheet of numbers (`auto-scan --review cmt sheet <event>`), and with no word of
+  what the checks test (`prompts/cmt_explore.md`). What it sees goes in the
+  `observations` table, each under a key naming the phenomenon. An event is read once,
+  and again if its CMT is re-run.
+
+The triage then takes **every** open finding and observation in one run (`max-findings`
+is 0, all, by default). It has a fourth outcome besides a code cause, an unexplained
+problem and a dismissal: the published result is wrong though no code is broken, which
+it files once per policy gap with the label `cmt-quality` and links every event's
+verdict to. For each observation it decides: already covered (`resolve <key> known`),
+new (an issue for the problem, and one in this repository proposing the check that would
+catch it from now on; `resolve <key> filed`), or not a problem (`resolve <key> dismissed`).
+
 `ci.yml` and `claude-review.yml` call meta-ci-action's shared workflows (`@v2`), as
 every ucgmsim repository does. `lefthook.yml` runs the same checks as git hooks
 (`uvx lefthook install`).

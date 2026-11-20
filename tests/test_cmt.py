@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 
 from auto_scan import engine, issues, publish, registry
-from auto_scan.cmt import checks, collect, extract, source
+from auto_scan.cmt import checks, collect, extract, observe, source, verdict
 from auto_scan.config import Config
 from auto_scan.db import connect, set_metric
 
@@ -365,7 +365,19 @@ def test_runs_disagree(tmp_path: Path) -> None:
     db = ingested(tmp_path, dev_tensor=deviatoric(flipped))
     [evaluation] = list(checks.runs_disagree(db, EVENT))
     assert evaluation.failing
-    assert evaluation.value is not None and evaluation.value > checks.KAGAN_MAX_DEG
+    assert evaluation.evidence["kagan_all_stations_to_drop_outliers_dev_deg"] > checks.KAGAN_MAX_DEG
+
+
+def test_runs_disagree_sees_the_azimuth_run(tmp_path: Path) -> None:
+    # all_stations and drop_outliers_dev agree; only the azimuth run is another mechanism.
+    db = ingested(tmp_path)
+    assert not next(iter(checks.runs_disagree(db, EVENT))).failing
+    set_metric(db, EVENT, "azimuth", "cmt.kagan_to_selected_deg", 86.8)
+    [evaluation] = list(checks.runs_disagree(db, EVENT))
+    assert evaluation.failing and evaluation.evidence["kagan_to_selected_deg"]["azimuth"] == 86.8
+    # A 33-degree azimuth run, as on the well-fitted 2026p866048, is not a disagreement.
+    set_metric(db, EVENT, "azimuth", "cmt.kagan_to_selected_deg", 32.7)
+    assert not next(iter(checks.runs_disagree(db, EVENT))).failing
 
 
 def test_selected_on_grid_edge_from_posterior(tmp_path: Path) -> None:
@@ -395,13 +407,10 @@ def test_posterior_not_rescaled(tmp_path: Path) -> None:
     assert failing(db, checks.posterior_overconfident) == {"": ["all_stations"]}
 
 
-def test_magnitude_offset_absolute_then_history(tmp_path: Path) -> None:
+def test_magnitude_offset_is_fixed_whatever_the_history(tmp_path: Path) -> None:
     db = ingested(tmp_path)
-    set_metric(db, EVENT, "", "cmt.mw_minus_geonet", 1.42)
-    [evaluation] = list(checks.magnitude_offset(db, EVENT))
-    assert evaluation.failing and evaluation.evidence["basis"] == "absolute"
-    # With history around -0.4, -0.3 passes and +0.6 fails.
-    for day, value in enumerate([-0.4, -0.5, -0.3, -0.45, -0.35, -0.4], start=1):
+    # A history of poor solutions (as the first eight events were) must not excuse +1.42.
+    for day, value in enumerate([-0.39, 0.35, -0.4, -0.13, 0.73, 0.08], start=1):
         past = f"2026p00000{day}"
         db.execute(
             "INSERT INTO events (event_id, event_dir, origin_time) VALUES (?, ?, ?)",
@@ -412,11 +421,115 @@ def test_magnitude_offset_absolute_then_history(tmp_path: Path) -> None:
             (past, f"2026-11-0{day}T01:00:00+00:00"),
         )
         set_metric(db, past, "", "cmt.mw_minus_geonet", value)
-    set_metric(db, EVENT, "", "cmt.mw_minus_geonet", -0.3)
-    assert not next(iter(checks.magnitude_offset(db, EVENT))).failing
-    set_metric(db, EVENT, "", "cmt.mw_minus_geonet", 0.6)
-    [evaluation] = list(checks.magnitude_offset(db, EVENT))
-    assert evaluation.failing and evaluation.evidence["basis"] == "history"
+    for offset, fails in [(1.42, True), (0.73, True), (0.35, False), (-0.55, False), (-1.2, True)]:
+        set_metric(db, EVENT, "", "cmt.mw_minus_geonet", offset)
+        assert next(iter(checks.magnitude_offset(db, EVENT))).failing is fails, offset
+
+
+def test_isotropic_and_no_signal(tmp_path: Path) -> None:
+    db = ingested(tmp_path)
+    assert failing(db, checks.selected_isotropic) == {} and failing(db, checks.no_signal) == {}
+    set_metric(db, EVENT, "all_stations", "cmt.iso_percent", 65.8)
+    assert failing(db, checks.selected_isotropic) == {"": ["all_stations"]}
+    set_metric(db, EVENT, "all_stations", "cmt.vr", 0.011)
+    set_metric(db, EVENT, "all_stations", "cmt.reduced_chi_square", 0.53)
+    assert failing(db, checks.no_signal) == {"": ["all_stations"]}
+    # A poor fit to real signal (the misfit far above the noise) is low VR, not no signal.
+    set_metric(db, EVENT, "all_stations", "cmt.reduced_chi_square", 6.8)
+    assert failing(db, checks.no_signal) == {}
+
+
+def graded(db: sqlite3.Connection) -> str:
+    result = verdict.grade(db, EVENT)
+    assert result is not None
+    return result.grade
+
+
+def test_verdict_grades(tmp_path: Path) -> None:
+    db = ingested(tmp_path)
+    assert graded(db) == "good"
+    [evaluation] = list(verdict.verdict(db, EVENT))
+    assert (evaluation.subject, evaluation.failing, evaluation.summary) == (EVENT, False, "good")
+    # One doubt: doubtful, and not a finding.
+    set_metric(db, EVENT, "all_stations", "cmt.iso_percent", 45.0)
+    assert graded(db) == "doubtful"
+    assert not next(iter(verdict.verdict(db, EVENT))).failing
+    # Three doubts reject it.
+    set_metric(db, EVENT, "all_stations", "cmt.jackknife.max_kagan_deg", 84.0)
+    set_metric(db, EVENT, "all_stations", "cmt.posterior.boundary_probability", 1.0)
+    [evaluation] = list(verdict.verdict(db, EVENT))
+    assert evaluation.failing and evaluation.evidence["grade"] == "reject"
+    assert {c["check_id"] for c in evaluation.evidence["failed_criteria"]} == {
+        "cmt.selected_isotropic",
+        "cmt.jackknife_unstable",
+        "cmt.selected_on_grid_edge",
+    }
+
+
+def test_one_reject_criterion_rejects_and_each_event_is_its_own_finding(tmp_path: Path) -> None:
+    db = ingested(tmp_path)
+    set_metric(db, EVENT, "all_stations", "cmt.n_stations", 2.0)
+    registry.load_cmt_plugins()
+    engine.run_checks(db, checks=registry.CMT_CHECKS)
+    finding = db.execute("SELECT * FROM findings WHERE check_id = 'cmt.verdict'").fetchone()
+    assert finding["subject"] == EVENT and finding["status"] == "open" and finding["severity"] == "high"
+    # Dismissing the shared criterion finding does not close the event's own verdict.
+    shared = db.execute("SELECT id FROM findings WHERE check_id = 'cmt.selected_few_stations'").fetchone()
+    issues.dismiss(db, shared["id"], "by design")
+    assert db.execute("SELECT status FROM findings WHERE check_id = 'cmt.verdict'").fetchone()[0] == "open"
+
+
+def population_db(tmp_path: Path, vrs: list[float], offsets: list[float], isos: list[float]) -> sqlite3.Connection:
+    """Events a day apart, each a clean download with its posted VR, Mw offset and ISO overridden."""
+    db = connect(":memory:")
+    for day, (vr, offset, iso) in enumerate(zip(vrs, offsets, isos, strict=True), start=1):
+        event = f"2026p00000{day}"
+        root = write_download(tmp_path / event)
+        db.execute(
+            "INSERT INTO events (event_id, event_dir, origin_time) VALUES (?, ?, ?)",
+            (event, event, f"2026-11-0{day}T00:00:00+00:00"),
+        )
+        for run in ("all_stations", "azimuth", "drop_outliers_dev"):
+            db.execute(
+                "INSERT INTO runs (event_id, resolution, status, written) VALUES (?, ?, 'ok', ?)",
+                (event, run, f"2026-11-0{day}T01:00:00+00:00"),
+            )
+        extract.extract_cmt(db, event, root)
+        set_metric(db, event, "all_stations", "cmt.vr", vr)
+        set_metric(db, event, "drop_outliers_dev", "cmt.vr", vr * 0.98)  # one parameter fewer: never higher
+        set_metric(db, event, "drop_outliers_dev", "cmt.vr", vr - 0.004)
+        set_metric(db, event, "", "cmt.mw_minus_geonet", offset)
+        set_metric(db, event, "all_stations", "cmt.iso_percent", iso)
+    return db
+
+
+def test_population_checks(tmp_path: Path) -> None:
+    # The pattern of the first eight events: two well fitted, the rest poor and inflated.
+    db = population_db(
+        tmp_path,
+        vrs=[0.64, 0.014, 0.19, 0.011, 0.03, 0.55],
+        offsets=[-0.39, 0.35, 0.73, 0.08, 1.42, -0.55],
+        isos=[-9, 8, -51, -54, -38, -10],
+    )
+    last = "2026p000006"
+    by_id = {e.check_id: e for e in verdict.population(db, last)}
+    share = by_id["cmt.population.rejected_share"]
+    assert share.failing and share.value == pytest.approx(4 / 6)
+    assert set(share.evidence["rejected"]) == {"2026p000002", "2026p000003", "2026p000004", "2026p000005"}
+    iso = by_id["cmt.population.isotropic_selected"]
+    assert iso.failing and iso.value == pytest.approx(3 / 6)
+    assert iso.evidence["vr_all_stations_vs_deviatoric"]["deviatoric_higher"] == 0
+    inflation = by_id["cmt.population.moment_inflation"]
+    assert inflation.failing and inflation.value == pytest.approx(0.54 - (-0.47))
+    # Too few events: no verdict on the population yet.
+    assert list(verdict.population(db, "2026p000004")) == []
+
+
+def test_population_passes_when_solutions_are_good(tmp_path: Path) -> None:
+    db = population_db(tmp_path, vrs=[0.6] * 5, offsets=[-0.4] * 5, isos=[-9] * 5)
+    evaluations = list(verdict.population(db, "2026p000005"))
+    assert {e.check_id for e in evaluations} == {"cmt.population.rejected_share", "cmt.population.isotropic_selected"}
+    assert not any(e.failing for e in evaluations)
 
 
 def test_outlier_drop_mismatch(tmp_path: Path) -> None:
@@ -556,3 +669,89 @@ def test_event_row_keeps_a_listed_zero(tmp_path: Path) -> None:
     row = collect._event_row(EVENT, zero, root)
     assert row["depth_km"] == 0.0  # not cmt_solution.csv's 10.0
     assert collect._event_row(EVENT, None, root)["depth_km"] == 10.0
+
+
+def observations_file(tmp_path: Path, entries: object) -> Path:
+    path = tmp_path / "observations.json"
+    path.write_text(json.dumps(entries))
+    return path
+
+
+def test_observations_are_recorded_grouped_and_resolved(tmp_path: Path) -> None:
+    db = ingested(tmp_path)
+    assert observe.unexplored(db) == [EVENT]
+    count = observe.import_observations(
+        db,
+        EVENT,
+        observations_file(
+            tmp_path,
+            [
+                {
+                    "key": "synthetics-out-of-phase",
+                    "title": "Synthetics lead the data at distant stations",
+                    "kind": "science",
+                    "severity": "medium",
+                    "confidence": "high",
+                    "body": "WVZ and KHZ, 2-3 s early.",
+                },
+                {"key": "Not A Slug", "title": "skipped"},
+                {"key": "no-title"},
+                "junk",
+            ],
+        ),
+    )
+    assert count == 1 and observe.pending(db) == 1 and observe.unexplored(db) == []
+    brief = issues.brief(db, review="cmt", config=Config())
+    assert "## Observation `synthetics-out-of-phase`" in brief and "WVZ and KHZ" in brief
+    # A simulation brief never shows them.
+    assert "synthetics-out-of-phase" not in issues.brief(db, review="simulation", config=Config())
+    with pytest.raises(ValueError, match="status"):
+        observe.resolve(db, "synthetics-out-of-phase", "maybe", "x")
+    assert (
+        observe.resolve(db, "synthetics-out-of-phase", "filed", "https://github.com/ucgmsim/cmt_solutions/issues/20")
+        == 1
+    )
+    assert observe.pending(db) == 0
+    with pytest.raises(ValueError, match="no unresolved"):
+        observe.resolve(db, "synthetics-out-of-phase", "known", "again")
+    # The key's name and earlier resolution reach the next event's reviewer and triage.
+    assert "`synthetics-out-of-phase` (1 event(s))" in observe.sheet(db, EVENT)
+    db.execute("INSERT INTO events (event_id, event_dir) VALUES ('2026p900000', '2026p900000')")
+    observe.import_observations(
+        db, "2026p900000", observations_file(tmp_path, [{"key": "synthetics-out-of-phase", "title": "Again"}])
+    )
+    assert "resolved before as **filed** on 1 event(s)" in observe.brief_section(db)
+
+
+def test_sheet_tells_the_reviewer_nothing_of_the_checks(tmp_path: Path) -> None:
+    db = ingested(tmp_path, m0_scale=10.0)
+    registry.load_cmt_plugins()
+    engine.run_checks(db, checks=registry.CMT_CHECKS)
+    text = observe.sheet(db, EVENT)
+    assert "cmt.vr" in text and "(this one)" in text
+    for leak in ("moment_inconsistent", "verdict", "reject", "threshold", "finding"):
+        assert leak not in text, leak
+
+
+def test_failed_reviews_are_retried_then_left(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    db = ingested(tmp_path)
+    missing = tmp_path / "nothing.json"
+    assert observe.import_observations(db, EVENT, missing) == 0
+    assert observe.unexplored(db) == [EVENT]
+    assert observe.import_observations(db, EVENT, observations_file(tmp_path, {"not": "a list"})) == 0
+    assert observe.unexplored(db) == []
+    # A re-run of the event's CMT is read afresh.
+    monkeypatch.setattr(source, "download_results", fake_download(tmp_path))
+    collect.ingest(Config(cache_dir=tmp_path), db, EVENT, listed(EVENT, "2026-11-18T00:00:00+00:00"))
+    assert observe.unexplored(db) == [EVENT]
+
+
+def test_brief_takes_every_finding_when_unlimited(tmp_path: Path) -> None:
+    db = ingested(tmp_path, m0_scale=10.0)
+    set_metric(db, EVENT, "all_stations", "cmt.n_stations", 2.0)
+    registry.load_cmt_plugins()
+    engine.run_checks(db, checks=registry.CMT_CHECKS)
+    n = db.execute("SELECT count(*) FROM findings WHERE status = 'open'").fetchone()[0]
+    assert n >= 3
+    assert issues.brief(db, max_findings=0, review="cmt", config=Config()).count("\n## Finding ") == n
+    assert issues.brief(db, max_findings=2, review="cmt", config=Config()).count("\n## Finding ") == 2

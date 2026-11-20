@@ -144,6 +144,22 @@ CREATE TABLE IF NOT EXISTS evaluations (
     PRIMARY KEY (check_id, subject, event_id, resolution)
 );
 
+-- What an open-ended review of one event noticed, with no check behind it (the CMT
+-- review's explorer, auto_scan.cmt.observe): one row an event and phenomenon.
+CREATE TABLE IF NOT EXISTS observations (
+    event_id TEXT NOT NULL,
+    key TEXT NOT NULL,                  -- names the phenomenon across events, e.g. depth-pinned-at-floor
+    title TEXT NOT NULL,
+    kind TEXT,                          -- science, perf or data
+    severity TEXT,                      -- the reviewer's guess: high, medium or low
+    confidence TEXT,                    -- high, medium or low
+    body TEXT,                          -- markdown: what was seen, in which files, with the numbers
+    status TEXT NOT NULL DEFAULT 'new', -- new, known (a check or issue covers it), filed, dismissed
+    resolution TEXT,                    -- the check or issue URL that covers it, or why it is no problem
+    created_at TEXT, resolved_at TEXT,
+    PRIMARY KEY (event_id, key)
+);
+
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 """
 
