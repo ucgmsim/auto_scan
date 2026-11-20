@@ -75,7 +75,6 @@ src/auto_scan/
   publish.py    pull(config, db_path), push(config, db_path, datasette=True) [deploy]
   issues.py     brief(db, max_findings), link(db, id, url), dismiss(db, id, reason), verify(db)  [deploy]
   cmt/          the CMT review: source.py, collect.py, extract.py, checks.py (see below)  [cmt]
-server/         Datasette plugin, views, dashboard                           [deploy]
 .github/workflows/, prompts/, README.md                                      [deploy]
 tests/test_<module>.py                                                       each owner
 ```
@@ -180,7 +179,7 @@ download's zip time, else SeismicNow's `cmt_applied_at`), so the ordering rules 
 hold: a CMT computed later for an older earthquake is a backlog event. Check ids and
 metrics start `cmt.`. `run_sources` stays empty (no code versions are published), so
 there is no suspect commit range. `push` uploads it to `/-/scan/upload/cmt`, the
-Datasette's `cmt` database (views `server/cmt_views.sql`, dashboard
+Datasette's `cmt` database (views in cylc-monitor's `server/cmt_views.sql`, dashboard
 `/-/dashboards/cmt`).
 
 The schedule only takes CMTs applied after the watermark (meta `cmt_since`, set on
@@ -192,9 +191,12 @@ older CMT layout: an event without `cmt_selection.csv` simply has no runs.
 
 `scan.db` lives at `Config.state_url` (Dropbox), so the Datasette is a view that
 can move: set `AUTO_SCAN_DATASETTE_URL` (GitHub variable `DATASETTE_URL`) and
-redeploy `server/`. `push` POSTs the database to
-`{datasette_url}/-/scan/upload` with the writer token; the plugin replaces the
-`scan` database's tables in one transaction.
+deploy the server side there. That side (the upload plugin, the views and the
+dashboards) is part of ucgmsim/cylc-monitor's `server/`, deployed with the Cylc
+monitor. `push` POSTs the database to `{datasette_url}/-/scan/upload` (cmt.db to
+`/-/scan/upload/cmt`) with the `scan-writer` token (`AUTO_SCAN_WRITER_TOKEN`); the
+plugin replaces the database's tables in one transaction. A change to the tables
+(`SCHEMA_VERSION`) needs the plugin and views in cylc-monitor changed first.
 
 ## Style
 
