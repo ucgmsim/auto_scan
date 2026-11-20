@@ -15,6 +15,10 @@ with an empty or truncated database:
 
 ``push`` also keeps the first snapshot of each day under ``history/``, so a bad
 upload can be undone by hand from yesterday's copy.
+
+The CMT review's database is stored the same way under another name
+(``store="cmt.db"``, history ``history/cmt-<YYYYMMDD>.db``) and uploaded to
+``/-/scan/upload/cmt``, which makes it the Datasette's ``cmt`` database.
 """
 
 import datetime
@@ -36,6 +40,7 @@ Runner = Callable[[Sequence[str]], subprocess.CompletedProcess[str]]
 Poster = Callable[[urllib.request.Request], bytes]
 
 STORE_NAME = "scan.db"
+CMT_STORE_NAME = "cmt.db"
 SQLITE_HEADER = b"SQLite format 3\x00"
 # rclone's exit codes for "directory not found" and "file not found"
 # (https://rclone.org/docs/#exit-code). Anything else is a real failure.
@@ -129,8 +134,8 @@ def _remove_sidecars(db_path: Path) -> None:
         sidecar.unlink(missing_ok=True)
 
 
-def pull(config: Config, db_path: Path, *, runner: Runner | None = None) -> None:
-    """Fetch ``scan.db`` from the state store.
+def pull(config: Config, db_path: Path, *, runner: Runner | None = None, store: str = STORE_NAME) -> None:
+    """Fetch ``scan.db`` (or ``store``) from the state store.
 
     When the store has no ``scan.db`` yet (the first run), nothing is written and
     ``auto_scan.db.connect`` later creates an empty database. Otherwise the local
@@ -146,6 +151,8 @@ def pull(config: Config, db_path: Path, *, runner: Runner | None = None) -> None
     runner : callable, optional
         Runs a command and returns its ``CompletedProcess`` (for tests); by
         default ``subprocess.run`` with captured text output.
+    store : str, optional
+        The file's name in the state store, by default ``scan.db``.
 
     Raises
     ------
@@ -155,7 +162,7 @@ def pull(config: Config, db_path: Path, *, runner: Runner | None = None) -> None
     """
     runner = runner or _run
     db_path = Path(db_path)
-    remote = _store_path(config)
+    remote = _store_path(config, store)
     if not _remote_exists(remote, runner):
         if db_path.exists():
             _warn(f"{remote} does not exist; keeping the local {db_path}, which push will upload")
@@ -164,7 +171,7 @@ def pull(config: Config, db_path: Path, *, runner: Runner | None = None) -> None
         return
     db_path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=db_path.parent, prefix=".pull-") as tmp:
-        fetched = Path(tmp) / STORE_NAME
+        fetched = Path(tmp) / store
         result = runner(["rclone", "copyto", remote, str(fetched)])
         if result.returncode != 0 or not fetched.is_file():
             raise StoreError(
@@ -189,7 +196,7 @@ def _snapshot(db_path: Path, out: Path) -> None:
         connection.close()
 
 
-def _check_shrink(config: Config, db_path: Path, events: int, runner: Runner) -> None:
+def _check_shrink(config: Config, db_path: Path, events: int, runner: Runner, store: str = STORE_NAME) -> None:
     """Refuse an upload that holds fewer events than the store did when pulled.
 
     Raises
@@ -202,9 +209,9 @@ def _check_shrink(config: Config, db_path: Path, events: int, runner: Runner) ->
     pulled = _get_meta(db_path, "pulled_events")
     if pulled is None:
         # Never pulled: a local database must not silently replace the store's.
-        if _remote_exists(_store_path(config), runner):
+        if _remote_exists(_store_path(config, store), runner):
             raise StoreError(
-                f"{db_path} was never pulled but {_store_path(config)} exists: run `auto-scan pull` first, "
+                f"{db_path} was never pulled but {_store_path(config, store)} exists: run `auto-scan pull` first, "
                 "or set AUTO_SCAN_ALLOW_SHRINK=1 to overwrite the store"
             )
         return
@@ -215,9 +222,11 @@ def _check_shrink(config: Config, db_path: Path, events: int, runner: Runner) ->
         )
 
 
-def _upload_datasette(config: Config, snapshot: Path, token: str, poster: Poster) -> None:
+def _upload_datasette(config: Config, snapshot: Path, token: str, poster: Poster, store: str = STORE_NAME) -> None:
     """POST a gzipped snapshot to the Datasette's upload route; failures are warnings."""
     url = f"{config.datasette_url}/-/scan/upload"
+    if store != STORE_NAME:
+        url += f"/{Path(store).stem}"
     body = gzip.compress(snapshot.read_bytes(), compresslevel=6)
     request = urllib.request.Request(
         url,
@@ -256,8 +265,9 @@ def push(
     runner: Runner | None = None,
     poster: Poster | None = None,
     today: datetime.date | None = None,
+    store: str = STORE_NAME,
 ) -> None:
-    """Store ``scan.db`` in the state store, then upload a copy to the Datasette.
+    """Store ``scan.db`` (or ``store``) in the state store, then upload a copy to the Datasette.
 
     A consistent snapshot (``VACUUM INTO``) is copied to ``{state_url}/scan.db``
     and, if the day has none yet, to ``{state_url}/history/scan-<YYYYMMDD>.db``.
@@ -280,6 +290,10 @@ def push(
         Sends a ``urllib.request.Request`` and returns the body (for tests).
     today : datetime.date, optional
         The date naming the history copy, by default today in UTC.
+    store : str, optional
+        The file's name in the state store, by default ``scan.db``; its stem
+        names the history copies and, for any other store, the upload route
+        (``/-/scan/upload/<stem>``).
 
     Raises
     ------
@@ -293,19 +307,19 @@ def push(
     if not db_path.is_file():
         raise StoreError(f"{db_path} does not exist: nothing to push")
     events = _count_events(db_path)
-    _check_shrink(config, db_path, events, runner)
+    _check_shrink(config, db_path, events, runner, store)
     day = (today or datetime.datetime.now(datetime.UTC).date()).strftime("%Y%m%d")
     with tempfile.TemporaryDirectory(prefix="auto-scan-push-") as tmp:
-        snapshot = Path(tmp) / STORE_NAME
+        snapshot = Path(tmp) / store
         _snapshot(db_path, snapshot)
-        remote = _store_path(config)
+        remote = _store_path(config, store)
         result = runner(["rclone", "copyto", str(snapshot), remote])
         if result.returncode != 0:
             raise StoreError(
                 f"rclone copyto {remote} failed (exit {result.returncode}): {(result.stderr or '').strip()}"
             )
         # The day's first snapshot is kept: a later bad push the same day can't overwrite it.
-        history = _store_path(config, f"history/scan-{day}.db")
+        history = _store_path(config, f"history/{Path(store).stem}-{day}.db")
         result = runner(["rclone", "copyto", "--ignore-existing", str(snapshot), history])
         if result.returncode != 0:
             _warn(f"could not keep the daily copy {history}: {(result.stderr or '').strip()}")
@@ -318,7 +332,7 @@ def push(
         if not token:
             _warn("no AUTO_SCAN_WRITER_TOKEN (or ~/.config/auto-scan/writer-token): not uploading to the Datasette")
             return
-        _upload_datasette(config, snapshot, token, poster)
+        _upload_datasette(config, snapshot, token, poster, store)
 
 
 __all__ = ["StoreError", "pull", "push"]

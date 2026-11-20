@@ -42,6 +42,9 @@ class Config:
         The monitor's database name there (``AUTO_SCAN_MONITOR_DATABASE``).
     scan_database : str
         The scan's database name there (``AUTO_SCAN_DATABASE``).
+    cmt_database : str
+        The CMT review's database name there (``AUTO_SCAN_CMT_DATABASE``); its
+        dashboard is ``/-/dashboards/cmt``.
     workflow : str
         The Cylc workflow whose events are scanned (``AUTO_SCAN_WORKFLOW``).
     results_url : str
@@ -57,6 +60,9 @@ class Config:
         Where an event's downloaded inputs are kept (``AUTO_SCAN_CACHE``).
     db_path : Path
         The local ``scan.db`` (``AUTO_SCAN_DB``).
+    cmt_db_path : Path
+        The local ``cmt.db``, the CMT review's database (``AUTO_SCAN_CMT_DB``). It
+        is kept in the state store beside ``scan.db``.
     user_agent : str
         Sent with every HTTP request: Cloudflare in front of SimDB and SeismicNow
         refuses the default urllib one (error 1010).
@@ -74,6 +80,7 @@ class Config:
     )
     monitor_database: str = field(default_factory=lambda: _env("AUTO_SCAN_MONITOR_DATABASE", "cylc"))
     scan_database: str = field(default_factory=lambda: _env("AUTO_SCAN_DATABASE", "scan"))
+    cmt_database: str = field(default_factory=lambda: _env("AUTO_SCAN_CMT_DATABASE", "cmt"))
     workflow: str = field(default_factory=lambda: _env("AUTO_SCAN_WORKFLOW", "realtime/run1"))
     results_url: str = field(
         default_factory=lambda: _env("AUTO_SCAN_RESULTS_URL", "dropbox:/QuakeCoRE/Jake/realtime_simulations")
@@ -91,6 +98,7 @@ class Config:
     )
     cache_dir: Path = field(default_factory=lambda: Path(_env("AUTO_SCAN_CACHE", "~/.cache/auto-scan")).expanduser())
     db_path: Path = field(default_factory=lambda: Path(_env("AUTO_SCAN_DB", "scan.db")).expanduser())
+    cmt_db_path: Path = field(default_factory=lambda: Path(_env("AUTO_SCAN_CMT_DB", "cmt.db")).expanduser())
     user_agent: str = "auto-scan/0.1 (+https://github.com/ucgmsim/auto_scan)"
     resolutions: tuple[str, ...] = ("0_25hz", "0_5hz", "1hz")
 

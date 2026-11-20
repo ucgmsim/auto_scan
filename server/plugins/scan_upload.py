@@ -1,12 +1,14 @@
-"""Datasette plugin: take a snapshot of auto_scan's ``scan.db`` and make it the ``scan`` database.
+"""Datasette plugin: take a snapshot of one of auto_scan's databases and make it the served one.
 
-    POST /-/scan/upload     body: the snapshot (SQLite, optionally gzipped)
+    POST /-/scan/upload         body: a snapshot of scan.db (SQLite, optionally gzipped)
+    POST /-/scan/upload/cmt     body: a snapshot of cmt.db, the CMT review's
 
 Sent by ``auto-scan push`` with the scan-writer token; any other actor gets 403. The
-snapshot must be an SQLite database whose ``meta.schema_version`` this plugin knows.
-Every table of the ``scan`` database is replaced by the snapshot's, in one transaction
-that also remakes the views (``scan_views.sql``): readers see the old database or the
-new, never a mixture. ``scan.db`` is kept whole elsewhere (the state store), so this is
+snapshot must be an SQLite database whose ``meta.schema_version`` this plugin knows
+(both databases share auto_scan's schema). Every table of the target database
+(``scan`` or ``cmt``) is replaced by the snapshot's, in one transaction that also
+remakes its views (``scan_views.sql`` or ``cmt_views.sql``): readers see the old
+database or the new, never a mixture. ``scan.db`` is kept whole elsewhere (the state store), so this is
 a copy, not a merge: tables the snapshot lacks are dropped.
 
 The merge (``merge``, ``views``, ``StdDev``) needs only the standard library, so the
@@ -26,7 +28,10 @@ from typing import Any
 
 DB = "scan"
 WRITER = "scan-writer"
-VIEWS = Path(__file__).resolve().parent.parent / "scan_views.sql"
+HERE = Path(__file__).resolve().parent.parent
+VIEWS = HERE / "scan_views.sql"
+# The databases an upload may replace, with the views made over each.
+TARGETS = {"scan": VIEWS, "cmt": HERE / "cmt_views.sql"}
 # The scan.db layouts this server's views understand (auto_scan.db.SCHEMA_VERSION).
 SCHEMA_VERSIONS = {"1"}
 # Both before and after gunzip. scan.db is tens of MB; this leaves room to grow.
@@ -144,7 +149,7 @@ def _validate(conn: sqlite3.Connection) -> list[tuple[str, str, str]]:
     return keep
 
 
-def merge(conn: sqlite3.Connection, snapshot: str, views_sql: str | None = None) -> dict[str, int]:
+def merge(conn: sqlite3.Connection, snapshot: str, views_sql: str | None = None, database: str = DB) -> dict[str, int]:
     """Replace every table of the database with the snapshot's, and remake the views, in one transaction.
 
     Parameters
@@ -154,7 +159,9 @@ def merge(conn: sqlite3.Connection, snapshot: str, views_sql: str | None = None)
     snapshot : str
         The uploaded snapshot's path.
     views_sql : str, optional
-        The views to make, by default ``scan_views.sql``'s text.
+        The views to make, by default the text of ``database``'s views file.
+    database : str, optional
+        Which database this is (a key of ``TARGETS``), by default ``scan``.
 
     Returns
     -------
@@ -166,7 +173,7 @@ def merge(conn: sqlite3.Connection, snapshot: str, views_sql: str | None = None)
     ValueError
         If the snapshot is damaged, isn't a scan.db, or has an unknown schema version.
     """
-    views_sql = VIEWS.read_text() if views_sql is None else views_sql
+    views_sql = TARGETS[database].read_text() if views_sql is None else views_sql
     conn.execute("attach database ? as up", (snapshot,))
     try:
         objects = _validate(conn)
@@ -195,19 +202,21 @@ def merge(conn: sqlite3.Connection, snapshot: str, views_sql: str | None = None)
     return counts
 
 
-def views(conn: sqlite3.Connection, views_sql: str | None = None) -> None:
+def views(conn: sqlite3.Connection, views_sql: str | None = None, database: str = DB) -> None:
     """(Re)make the views, if the database holds a scan (they need its tables).
 
     Parameters
     ----------
     conn : sqlite3.Connection
-        The scan database's write connection.
+        The database's write connection.
     views_sql : str, optional
-        The views to make, by default ``scan_views.sql``'s text.
+        The views to make, by default the text of ``database``'s views file.
+    database : str, optional
+        Which database this is (a key of ``TARGETS``), by default ``scan``.
     """
     if not conn.execute("select 1 from sqlite_master where type = 'table' and name = 'findings'").fetchone():
         return
-    views_sql = VIEWS.read_text() if views_sql is None else views_sql
+    views_sql = TARGETS[database].read_text() if views_sql is None else views_sql
     conn.execute("begin immediate")
     try:
         for statement in statements(views_sql):
@@ -272,7 +281,7 @@ except ImportError:  # the tests: only the merge above is used
 else:
 
     async def upload(request: Request, datasette: Datasette) -> Response:
-        """Handle POST /-/scan/upload: make the snapshot in the body the scan database.
+        """Handle POST /-/scan/upload[/cmt]: make the snapshot in the body the scan (or cmt) database.
 
         Parameters
         ----------
@@ -293,6 +302,9 @@ else:
         """
         if (request.actor or {}).get("id") != WRITER:
             raise Forbidden("only the scan-writer token may upload")
+        name = request.url_vars.get("database") or DB
+        if name not in TARGETS:
+            return Response.json({"ok": False, "error": f"unknown database {name!r}"}, status=404)
         if request.method != "POST":
             return Response.json({"ok": False, "error": "POST a snapshot"}, status=405)
         length = request.headers.get("content-length")
@@ -306,14 +318,16 @@ else:
         if not body.startswith(SQLITE_HEADER):
             return Response.json({"ok": False, "error": "not an SQLite database"}, status=400)
         try:
-            db = datasette.get_database(DB)
+            db = datasette.get_database(name)
         except KeyError:
-            return Response.json({"ok": False, "error": f"no {DB} database: serve /data/{DB}.db"}, status=500)
+            return Response.json({"ok": False, "error": f"no {name} database: serve /data/{name}.db"}, status=500)
         with tempfile.NamedTemporaryFile(suffix=".db", dir=Path(str(db.path)).parent) as snapshot:
             snapshot.write(body)
             snapshot.flush()
             try:
-                counts = await db.execute_write_fn(lambda conn: merge(conn, snapshot.name), transaction=False)
+                counts = await db.execute_write_fn(
+                    lambda conn: merge(conn, snapshot.name, database=name), transaction=False
+                )
             except (sqlite3.Error, ValueError) as error:
                 return Response.json({"ok": False, "error": str(error)}, status=400)
         return Response.json({"ok": True, "rows": counts})
@@ -345,22 +359,25 @@ else:
         """
 
         async def inner() -> None:
-            """Remake the views of the scan database, if it is served."""
-            if DB in datasette.databases:
-                await datasette.get_database(DB).execute_write_fn(views, transaction=False)
+            """Remake the views of each served database the plugin knows."""
+            for name in TARGETS:
+                if name in datasette.databases:
+                    await datasette.get_database(name).execute_write_fn(
+                        lambda conn, name=name: views(conn, database=name), transaction=False
+                    )
 
         return inner
 
     @hookimpl
     def register_routes() -> list[tuple[str, Callable]]:
-        """Register the upload route.
+        """Register the upload route, ``/-/scan/upload`` (scan) and ``/-/scan/upload/<database>``.
 
         Returns
         -------
         list[tuple[str, Callable]]
             The route's pattern and view.
         """
-        return [(r"^/-/scan/upload$", upload)]
+        return [(r"^/-/scan/upload(?:/(?P<database>[a-z]+))?$", upload)]
 
     @hookimpl
     def skip_csrf(scope: dict) -> bool:
@@ -376,4 +393,4 @@ else:
         bool
             Whether this is an upload.
         """
-        return scope["path"] == "/-/scan/upload"
+        return scope["path"] == "/-/scan/upload" or scope["path"].startswith("/-/scan/upload/")

@@ -10,6 +10,15 @@
     auto-scan push              store scan.db and upload it to the Datasette
     auto-scan run               pull, collect, check, verify, push
 
+``--review cmt`` (before the subcommand) does the same for the CMT review:
+SeismicNow's automatic CMT inversions, in cmt.db ($AUTO_SCAN_CMT_DB). Its collect
+takes any number of event ids, whatever their age; with none it takes the CMTs
+SeismicNow posted since the last run.
+
+    auto-scan --review cmt run
+    auto-scan --review cmt collect 2026p866048 2026p862161 --force
+    auto-scan --review cmt fetch 2026p866048 --out .ai/cmt/2026p866048   (unpack its results)
+
 Each subcommand is one function in the module that owns it; this file only parses.
 """
 
@@ -17,7 +26,9 @@ import argparse
 import sys
 from pathlib import Path
 
-from auto_scan import collect, engine, issues, publish
+from auto_scan import collect, engine, issues, publish, registry
+from auto_scan.cmt import collect as cmt_collect
+from auto_scan.cmt import source as cmt_source
 from auto_scan.config import Config
 from auto_scan.db import connect
 
@@ -38,14 +49,27 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="auto-scan", description=__doc__, formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument("--db", type=Path, help="scan.db (default: $AUTO_SCAN_DB or ./scan.db)")
+    parser.add_argument(
+        "--db", type=Path, help="the database (default: $AUTO_SCAN_DB or ./scan.db; cmt: $AUTO_SCAN_CMT_DB or ./cmt.db)"
+    )
+    parser.add_argument(
+        "--review",
+        choices=("simulation", "cmt"),
+        default="simulation",
+        help="which review: the realtime simulations (default) or SeismicNow's CMTs",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("pull")
-    for name in ("collect", "check"):
-        command = commands.add_parser(name)
-        command.add_argument("event", nargs="?", help="only this event id")
-        command.add_argument("--force", action="store_true", help="redo runs already scanned")
+    command = commands.add_parser("collect")
+    command.add_argument("events", nargs="*", help="only these event ids (the simulation review takes one)")
+    command.add_argument("--force", action="store_true", help="redo runs already scanned")
+    command = commands.add_parser("check")
+    command.add_argument("event", nargs="?", help="only this event id")
+    command.add_argument("--force", action="store_true", help="unused; kept for symmetry with collect")
     commands.add_parser("verify")
+    fetch = commands.add_parser("fetch")
+    fetch.add_argument("event")
+    fetch.add_argument("--out", type=Path, required=True, help="directory to unpack into (replaced)")
     brief = commands.add_parser("brief")
     brief.add_argument("--out", type=Path, help="write the brief here instead of stdout")
     brief.add_argument("--max-findings", type=int, default=5)
@@ -62,22 +86,64 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     config = Config()
-    db_path = args.db or config.db_path
+    cmt = args.review == "cmt"
+    db_path = args.db or (config.cmt_db_path if cmt else config.db_path)
+    store = publish.CMT_STORE_NAME if cmt else publish.STORE_NAME
+    if args.command == "collect" and not cmt and len(args.events) > 1:
+        parser.error("the simulation review collects one event at a time")
+
+    def run_collect(events: list[str], force: bool) -> None:
+        """Collect for the chosen review.
+
+        Parameters
+        ----------
+        events : list of str
+            The event ids named, or none for every new one.
+        force : bool
+            Redo events already scanned.
+        """
+        if cmt:
+            cmt_collect.collect(config, db, events=events or None, force=force)
+        else:
+            collect.collect(config, db, event=events[0] if events else None, force=force)
+
+    def run_checks(event: str | None) -> None:
+        """Check for the chosen review.
+
+        Parameters
+        ----------
+        event : str or None
+            Only this event id, or every event.
+        """
+        if cmt:
+            registry.load_cmt_plugins()
+            engine.run_checks(db, event=event, checks=registry.CMT_CHECKS)
+        else:
+            engine.run_checks(db, event=event)
+
+    if args.command == "fetch":
+        if not cmt:
+            parser.error("fetch is for --review cmt; the simulations' files are in the rclone results store")
+        if cmt_source.download_results(config, args.event, args.out) is None:
+            print(f"auto-scan: SeismicNow has no CMT results for {args.event}", file=sys.stderr)
+            return 1
+        print(f"auto-scan: unpacked {args.event}'s CMT results into {args.out}", file=sys.stderr)
+        return 0
     if args.command == "pull":
-        publish.pull(config, db_path)
+        publish.pull(config, db_path, store=store)
         return 0
     if args.command == "run":
-        publish.pull(config, db_path)
+        publish.pull(config, db_path, store=store)
     db = connect(db_path)
     try:
         if args.command == "collect":
-            collect.collect(config, db, event=args.event, force=args.force)
+            run_collect(args.events, args.force)
         elif args.command == "check":
-            engine.run_checks(db, event=args.event)
+            run_checks(args.event)
         elif args.command == "verify":
             issues.verify(db)
         elif args.command == "brief":
-            text = issues.brief(db, max_findings=args.max_findings)
+            text = issues.brief(db, max_findings=args.max_findings, review=args.review)
             if args.out:
                 args.out.write_text(text)
             else:
@@ -87,14 +153,14 @@ def main(argv: list[str] | None = None) -> int:
         elif args.command == "dismiss":
             issues.dismiss(db, args.finding, args.reason)
         elif args.command == "run":
-            collect.collect(config, db)
-            engine.run_checks(db)
+            run_collect([], False)
+            run_checks(None)
             issues.verify(db)
         db.commit()
     finally:
         db.close()
     if args.command == "push":
-        publish.push(config, db_path, datasette=not args.no_datasette)
+        publish.push(config, db_path, datasette=not args.no_datasette, store=store)
     elif args.command == "run" and not args.no_push:
-        publish.push(config, db_path)
+        publish.push(config, db_path, store=store)
     return 0

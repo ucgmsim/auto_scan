@@ -313,3 +313,69 @@ def test_dashboard_has_data(target: sqlite3.Connection, snapshot: Path) -> None:
     options = {"resolution": "1hz"}
     for name in ("chart event-terms", "chart xres", "chart speed", "chart cost", "chart mpi", "chart time-to-results"):
         assert target.execute(fill(queries[name], options), options).fetchall(), f"{name} is empty"
+
+
+def make_cmt_snapshot(path: Path, tmp_path: Path) -> None:
+    """A cmt.db with two events extracted from synthetic downloads, checked."""
+    from test_cmt import EVENT, write_download
+
+    from auto_scan import engine, registry
+    from auto_scan.cmt import extract
+
+    db = connect(path)
+    for day, event in enumerate([EVENT, "2026p866049"], start=1):
+        root = write_download(tmp_path / event)
+        db.execute(
+            "INSERT INTO events (event_id, event_dir, origin_time, magnitude) VALUES (?, ?, ?, 4.8)",
+            (event, event, f"2026-11-1{day}T10:30:48+00:00"),
+        )
+        for run in ("all_stations", "azimuth", "drop_outliers_dev"):
+            db.execute(
+                "INSERT INTO runs (event_id, resolution, status, written) VALUES (?, ?, 'ok', ?)",
+                (event, run, f"2026-11-1{day}T10:58:20+00:00"),
+            )
+        extract.extract_cmt(db, event, root)
+    registry.load_cmt_plugins()
+    engine.run_checks(db, checks=registry.CMT_CHECKS)
+    db.commit()
+    db.close()
+
+
+def cmt_dashboard() -> dict:
+    yaml = pytest.importorskip("yaml")
+    dashboard = yaml.safe_load((SERVER / "cmt_dashboard.yaml").read_text())["cmt"]
+    assert {cell for row in dashboard["layout"] for cell in row} == set(dashboard["charts"])
+    assert len({len(row) for row in dashboard["layout"]}) == 1
+    assert all(spec["db"] == "cmt" for spec in [*dashboard["charts"].values(), *dashboard["filters"].values()])
+    return dashboard
+
+
+@pytest.mark.parametrize("options", [{}, {"run": "all_stations"}])
+def test_cmt_views_and_dashboard(tmp_path: Path, options: dict[str, str]) -> None:
+    snapshot = tmp_path / "upload.db"
+    make_cmt_snapshot(snapshot, tmp_path)
+    target = sqlite3.connect(tmp_path / "cmt.db")
+    plugin.add_functions(target)
+    counts = plugin.merge(target, str(snapshot), database="cmt")
+    assert counts["events"] == 2 and counts["runs"] == 6
+    assert {"findings_open", "cmt_by_run", "cmt_event_summary", "cmt_timings"} <= names(target, "view")
+    assert "event_summary" not in names(target, "view")  # the simulation views are not made here
+    target.row_factory = sqlite3.Row
+    row = target.execute("SELECT * FROM cmt_event_summary WHERE event_id = '2026p866048'").fetchone()
+    assert row["selected_run"] == "all_stations" and row["geonet_magnitude"] == pytest.approx(5.33)
+    assert row["n_stations"] == 4 and row["n_runs_ok"] == 3 and row["minutes_to_solution"] == pytest.approx(27.5)
+    run = target.execute(
+        "SELECT * FROM cmt_by_run WHERE event_id = '2026p866048' AND run = 'drop_outliers_dev'"
+    ).fetchone()
+    assert run["deviatoric"] == 1 and run["iso_percent"] == pytest.approx(0.0)
+    stages = {r["stage"] for r in target.execute("SELECT stage FROM cmt_timings WHERE run = 'all_stations'")}
+    assert stages == {"mouse_detection", "process_data", "other"}
+    for view in sorted(names(target, "view")):
+        target.execute(f"SELECT * FROM {view}").fetchall()
+    dashboard = cmt_dashboard()
+    queries = [spec["query"] for spec in [*dashboard["filters"].values(), *dashboard["charts"].values()]]
+    for query in queries:
+        target.execute(fill(query, options), options).fetchall()
+    stages_query = fill(dashboard["charts"]["stages"]["query"], options)
+    assert target.execute(stages_query, options).fetchall(), "the stages chart is empty"
+    plugin.views(target, database="cmt")  # startup remakes them
