@@ -100,15 +100,34 @@ def _event_row(event_id: str, listed: source.CmtEvent | None, event_dir: Path) -
     """The ``events`` row: SeismicNow's active values, else the download's own."""
     origin = first_row(read_rows(event_dir / "event.csv"))
     solution = first_row(read_rows(event_dir / "cmt_solution.csv"))
+
+    def prefer(field: str, fallback: Any) -> Any:
+        """SeismicNow's value of a field when it has one, else ``fallback``.
+
+        Parameters
+        ----------
+        field : str
+            The ``source.CmtEvent`` attribute.
+        fallback : Any
+            The download's own value.
+
+        Returns
+        -------
+        Any
+            The listed value unless it is None (a 0.0 depth is a value).
+        """
+        value = getattr(listed, field) if listed is not None else None
+        return fallback if value is None else value
+
     row: dict[str, Any] = {
         "event_id": event_id,
         "cycle": None,
         "event_dir": event_id,
-        "origin_time": (listed.origin_time if listed else None) or source.http_date_to_iso(origin.get("datetime")),
-        "magnitude": (listed.magnitude if listed else None) or number(solution.get("Mw")),
-        "latitude": (listed.latitude if listed else None) or number(solution.get("Latitude")),
-        "longitude": (listed.longitude if listed else None) or number(solution.get("Longitude")),
-        "depth_km": (listed.depth_km if listed else None) or number(solution.get("CD")),
+        "origin_time": prefer("origin_time", source.http_date_to_iso(origin.get("datetime"))),
+        "magnitude": prefer("magnitude", number(solution.get("Mw"))),
+        "latitude": prefer("latitude", number(solution.get("Latitude"))),
+        "longitude": prefer("longitude", number(solution.get("Longitude"))),
+        "depth_km": prefer("depth_km", number(solution.get("CD"))),
         "location": listed.locality if listed else None,
     }
     return row

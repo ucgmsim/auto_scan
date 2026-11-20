@@ -548,3 +548,11 @@ def test_cmt_store_has_its_own_name_and_history(tmp_path: Path) -> None:
     targets = [call[-1] for call in calls if call[1] == "copyto"]
     assert targets[0] == "remote:/state/cmt.db"
     assert targets[1].startswith("remote:/state/history/cmt-")
+
+
+def test_event_row_keeps_a_listed_zero(tmp_path: Path) -> None:
+    root = write_download(tmp_path / EVENT)
+    zero = source.CmtEvent(event_id=EVENT, depth_km=0.0, magnitude=4.79)
+    row = collect._event_row(EVENT, zero, root)
+    assert row["depth_km"] == 0.0  # not cmt_solution.csv's 10.0
+    assert collect._event_row(EVENT, None, root)["depth_km"] == 10.0
